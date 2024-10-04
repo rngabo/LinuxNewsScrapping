@@ -16,6 +16,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 
+
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GdkX11, GLib
 
@@ -93,6 +94,9 @@ class NewsDock(Gtk.Window):
         self.model_name = "t5-large"  # t-small: missleading, t5-large:2/6, t5-base:2/6, t5-11b, t5-3b 
         self.model = T5ForConditionalGeneration.from_pretrained(self.model_name)
         self.tokenizer = T5Tokenizer.from_pretrained(self.model_name)
+        # self.model_name = "facebook/llama-70b"  # Adjust this to the correct model name/path
+        # self.model = LlamaForConditionalGeneration.from_pretrained(self.model_name)
+        # self.tokenizer = LlamaTokenizer.from_pretrained(self.model_name)
         #Pegasus // verbose a bit long
         # self.model_name = "google/pegasus-large"  # or "google/pegasus-xsum" based on your needs
         # self.model = PegasusForConditionalGeneration.from_pretrained(self.model_name)
@@ -390,9 +394,9 @@ class NewsDock(Gtk.Window):
                 return {"title": "Failed to retrieve the page.", "link": ""}
 
         # Extract the text content of the element
-        post_picker_div = soup.find('div', class_='wp-block-tc23-post-picker')
+        post_picker_div = soup.find('div', class_='wp-block-techcrunch-card')
         if post_picker_div:
-            title_element = post_picker_div.find('h2', class_='wp-block-post-title')
+            title_element = post_picker_div.find('h3', class_='loop-card__title')
             if title_element and title_element.a:
                 title = title_element.get_text(strip=True)
                 link = title_element.a['href']
