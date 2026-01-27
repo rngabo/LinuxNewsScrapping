@@ -4,7 +4,6 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import warnings
-import os
 
 from gi.repository import GObject
 from selenium import webdriver
@@ -14,19 +13,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# Force X11 backend for proper dock behavior on Wayland via XWayland
-os.environ['GDK_BACKEND'] = 'x11'
-
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk, GLib
-
-# Try to import X11 support
-try:
-    from gi.repository import GdkX11
-    X11_AVAILABLE = True
-except ImportError:
-    X11_AVAILABLE = False
-    print("Warning: GdkX11 not available. Dock behavior may not work properly.")
+from gi.repository import Gtk, Gdk, GdkX11, GLib
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -156,72 +144,19 @@ class NewsDock(Gtk.Window):
         self.clear_loading_message(summary_content)
 
     def configure_window(self):
-        # Configure as dock window
         self.set_type_hint(Gdk.WindowTypeHint.DOCK)
         self.set_keep_above(True)
         self.set_decorated(False)
-        
-        # Skip taskbar
-        self.set_skip_taskbar_hint(True)
-        self.set_skip_pager_hint(True)
-        
-        # Stick to all workspaces
-        self.stick()
-        
-        # Get screen dimensions
+
         display = Gdk.Display.get_default()
-        monitor = display.get_monitor(0) if display.get_primary_monitor() is None else display.get_primary_monitor()
-        
-        if monitor:
-            geometry = monitor.get_geometry()
-            self.set_default_size(geometry.width, -1)
-        
-        # Connect realize signal to set strut
+        monitor = display.get_primary_monitor()
+        geometry = monitor.get_geometry()
+        self.set_default_size(geometry.width, -1)
         self.connect("realize", self.on_realize)
 
     def create_news_layout(self):
-        # Apply CSS for better styling
-        css_provider = Gtk.CssProvider()
-        css_data = b"""
-        window {
-            background-color: #2e3440;
-        }
-        label {
-            color: #eceff4;
-        }
-        button {
-            background-color: #242933;
-            color: #eceff4;
-            border: none;
-            padding: 2px 6px;
-            margin: 0px;
-            min-width: 20px;
-            min-height: 20px;
-            font-size: 10px;
-        }
-        button:hover {
-            background-color: #1a1f28;
-        }
-        .read-button {
-            background: #242933;
-            margin-left: 15px;
-        }
-        .read-button:hover {
-            background-color: #2e3440;
-        }
-        """
-        css_provider.load_from_data(css_data)
-        screen = Gdk.Screen.get_default()
-        style_context = Gtk.StyleContext()
-        style_context.add_provider_for_screen(screen, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        
         self.grid = Gtk.Grid()
         self.grid.set_column_spacing(20)
-        self.grid.set_row_spacing(2)
-        self.grid.set_margin_top(5)
-        self.grid.set_margin_bottom(5)
-        self.grid.set_margin_start(10)
-        self.grid.set_margin_end(10)
 
         # Middle column: summary/loading
         self.loading_label = Gtk.Label("Loading...")
@@ -229,10 +164,9 @@ class NewsDock(Gtk.Window):
         self.loading_label.set_valign(Gtk.Align.START)
         self.loading_label.set_halign(Gtk.Align.START)
         self.loading_label.set_margin_start(20)
-        self.loading_label.set_max_width_chars(50)
         self.loading_label.set_markup("<span size='large'></span>")
 
-        # Optional content label
+        # Optional content label (kept from your original)
         self.content_label = Gtk.Label()
         self.content_label.set_line_wrap(True)
         self.content_label.set_valign(Gtk.Align.START)
@@ -242,15 +176,16 @@ class NewsDock(Gtk.Window):
 
         # Right column: Jobs panel
         self.jobs_label = Gtk.Label()
-        self.jobs_label.set_line_wrap(False)
+        self.jobs_label.set_line_wrap(True)
         self.jobs_label.set_valign(Gtk.Align.START)
         self.jobs_label.set_halign(Gtk.Align.START)
         self.jobs_label.set_margin_start(20)
-        self.jobs_label.set_max_width_chars(40)
         self.jobs_label.set_markup("<span size='large'><b>Jobs (JobInRwanda)</b>\nLoading...</span>")
 
         self.add_news_to_grid()
         self.add(self.grid)
+        self.jobs_label.set_line_wrap(False)     # prevents tall wrap (main cause of height growth)
+
 
     def add_news_to_grid(self):
         for child in self.grid.get_children():
@@ -260,24 +195,17 @@ class NewsDock(Gtk.Window):
         self.news = self.fetch_news()
 
         for key, value in self.news.items():
-            hbox = Gtk.HBox(False, 2)
-            
-            # Show full title text
-            title_text = value['title']
-            
-            title = Gtk.Label.new(f"{key}: {title_text}")
-            title.set_line_wrap(False)
-            title.set_ellipsize(0)  # NONE - no ellipsizing
-            title.set_halign(Gtk.Align.START)
-            
+            hbox = Gtk.HBox(False, 5)
+            title = Gtk.Label.new(f"{key}: {value['title']}")
             button_read = Gtk.Button.new_with_label("→")
-            button_read.set_size_request(25, 25)
-            button_read.get_style_context().add_class("read-button")
+            button_clear = Gtk.Button.new_with_label("Clear")
 
             button_read.connect("clicked", self.on_arrow_click, key)
+            button_clear.connect("clicked", self.on_clear_click)
 
-            hbox.pack_start(title, True, True, 0)
+            hbox.pack_start(title, False, False, 0)
             hbox.pack_start(button_read, False, False, 0)
+            hbox.pack_start(button_clear, False, False, 0)
 
             self.grid.attach(hbox, 0, row_number, 1, 1)
             row_number += 1
@@ -300,20 +228,18 @@ class NewsDock(Gtk.Window):
 
             # Website section
             if website_titles:
-                lines.append("Other")
+                lines.append("Other")   # keep/remove this label as you want
                 for t in website_titles:
-                    job_title = t[:55] + "..." if len(t) > 55 else t
-                    lines.append(f"• {GLib.markup_escape_text(job_title)}")
+                    lines.append(f"• {GLib.markup_escape_text(t)}")
             else:
                 lines.append("Other")
                 lines.append("• Not yet.")
 
             # Spacer + International section
-            lines.append("")
+            lines.append("")  # blank line between groups
             if intl_titles:
                 for t in intl_titles:
-                    job_title = t[:55] + "..." if len(t) > 55 else t
-                    lines.append(f"• {GLib.markup_escape_text(job_title)}")
+                    lines.append(f"• {GLib.markup_escape_text(t)}")
             else:
                 lines.append("• Not yet.")
 
@@ -323,6 +249,7 @@ class NewsDock(Gtk.Window):
         except Exception as e:
             self.jobs_label.set_markup("<span>Failed to load.</span>")
             print(f"Error fetching JobInRwanda jobs: {e}")
+
 
     def on_clear_click(self, button):
         self.loading_label.set_text("")
@@ -450,6 +377,7 @@ class NewsDock(Gtk.Window):
             return {"title": "Error occurred while parsing.", "link": ""}
 
     def africa_parser(self, soup):
+        # Same logic as world_parser
         return self.world_parser(soup)
 
     def rwanda_parser(self, soup):
@@ -535,71 +463,27 @@ class NewsDock(Gtk.Window):
         return content
 
     def on_realize(self, widget):
-        if X11_AVAILABLE:
-            window = self.get_window()
-            xid = window.get_xid()
-            self.set_strut(xid)
+        window = self.get_window()
+        xid = window.get_xid()
+        self.set_strut(xid)
         self.resize_to_fit_content()
 
     def resize_to_fit_content(self):
         display = Gdk.Display.get_default()
-        monitor = display.get_monitor(0) if display.get_primary_monitor() is None else display.get_primary_monitor()
-        
-        if not monitor:
-            return
-            
+        monitor = display.get_primary_monitor()
         geometry = monitor.get_geometry()
         preferred_height = self.get_preferred_height()[1]
         self.set_default_size(geometry.width, preferred_height)
         self.move(0, geometry.height - preferred_height)
 
     def set_strut(self, xid):
-        """Set _NET_WM_STRUT to reserve space at bottom of screen"""
         display = Gdk.Display.get_default()
-        monitor = display.get_monitor(0) if display.get_primary_monitor() is None else display.get_primary_monitor()
-        
-        if not monitor:
-            return
-            
+        monitor = display.get_primary_monitor()
         geometry = monitor.get_geometry()
         preferred_height = self.get_preferred_height()[1]
-        
-        # _NET_WM_STRUT_PARTIAL format:
-        # left, right, top, bottom, left_start_y, left_end_y, right_start_y, right_end_y,
-        # top_start_x, top_end_x, bottom_start_x, bottom_end_x
-        data = [
-            0,  # left
-            0,  # right
-            0,  # top
-            preferred_height,  # bottom
-            0,  # left_start_y
-            0,  # left_end_y
-            0,  # right_start_y
-            0,  # right_end_y
-            0,  # top_start_x
-            0,  # top_end_x
-            0,  # bottom_start_x
-            geometry.width  # bottom_end_x
-        ]
-        
-        try:
-            # Set basic strut
-            subprocess.run([
-                "xprop", "-id", str(xid),
-                "-f", "_NET_WM_STRUT", "32c",
-                "-set", "_NET_WM_STRUT",
-                ",".join(map(str, data[:4]))
-            ], check=False)
-            
-            # Set partial strut for better multi-monitor support
-            subprocess.run([
-                "xprop", "-id", str(xid),
-                "-f", "_NET_WM_STRUT_PARTIAL", "32c",
-                "-set", "_NET_WM_STRUT_PARTIAL",
-                ",".join(map(str, data))
-            ], check=False)
-        except Exception as e:
-            print(f"Failed to set strut: {e}")
+        data = [0, 0, 0, preferred_height, 0, geometry.height, 0, geometry.height + preferred_height, 0, geometry.width, 0, geometry.width]
+        subprocess.run(["xprop", "-id", str(xid), "-f", "_NET_WM_STRUT", "32c", "-set", "_NET_WM_STRUT", ",".join(map(str, data[:4]))])
+        subprocess.run(["xprop", "-id", str(xid), "-f", "_NET_WM_STRUT_PARTIAL", "32c", "-set", "_NET_WM_STRUT_PARTIAL", ",".join(map(str, data))])
 
     def on_tray_popup(self, icon, button, time):
         self.menu = Gtk.Menu()
