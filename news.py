@@ -214,7 +214,7 @@ class NewsDock(Gtk.Window):
         screen = Gdk.Screen.get_default()
         style_context = Gtk.StyleContext()
         style_context.add_provider_for_screen(screen, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        
+
         self.grid = Gtk.Grid()
         self.grid.set_column_spacing(20)
         self.grid.set_row_spacing(2)
@@ -223,24 +223,7 @@ class NewsDock(Gtk.Window):
         self.grid.set_margin_start(10)
         self.grid.set_margin_end(10)
 
-        # Middle column: summary/loading
-        self.loading_label = Gtk.Label("Loading...")
-        self.loading_label.set_line_wrap(True)
-        self.loading_label.set_valign(Gtk.Align.START)
-        self.loading_label.set_halign(Gtk.Align.START)
-        self.loading_label.set_margin_start(20)
-        self.loading_label.set_max_width_chars(50)
-        self.loading_label.set_markup("<span size='large'></span>")
-
-        # Optional content label
-        self.content_label = Gtk.Label()
-        self.content_label.set_line_wrap(True)
-        self.content_label.set_valign(Gtk.Align.START)
-        self.content_label.set_halign(Gtk.Align.START)
-        self.content_label.set_margin_start(20)
-        self.content_label.set_markup("<span size='large'></span>")
-
-        # Right column: Jobs panel
+        # Right column: Jobs panel (keep)
         self.jobs_label = Gtk.Label()
         self.jobs_label.set_line_wrap(False)
         self.jobs_label.set_valign(Gtk.Align.START)
@@ -252,6 +235,7 @@ class NewsDock(Gtk.Window):
         self.add_news_to_grid()
         self.add(self.grid)
 
+
     def add_news_to_grid(self):
         for child in self.grid.get_children():
             self.grid.remove(child)
@@ -261,32 +245,27 @@ class NewsDock(Gtk.Window):
 
         for key, value in self.news.items():
             hbox = Gtk.HBox(False, 2)
-            
-            # Show full title text
+
             title_text = value['title']
-            
             title = Gtk.Label.new(f"{key}: {title_text}")
             title.set_line_wrap(False)
-            title.set_ellipsize(0)  # NONE - no ellipsizing
             title.set_halign(Gtk.Align.START)
-            
+
             button_read = Gtk.Button.new_with_label("→")
             button_read.set_size_request(25, 25)
             button_read.get_style_context().add_class("read-button")
-
             button_read.connect("clicked", self.on_arrow_click, key)
 
             hbox.pack_start(title, True, True, 0)
             hbox.pack_start(button_read, False, False, 0)
 
+            # column 0 = news
             self.grid.attach(hbox, 0, row_number, 1, 1)
             row_number += 1
 
-        # column 1 (middle): summary/loading
-        self.grid.attach(self.loading_label, 1, 0, 1, row_number)
+        # column 1 = jobs (moved from col 2 -> col 1 since middle is removed)
+        self.grid.attach(self.jobs_label, 1, 0, 1, row_number)
 
-        # column 2 (right): jobs
-        self.grid.attach(self.jobs_label, 2, 0, 1, row_number)
 
     def refresh_jobs_panel(self):
         try:
@@ -329,10 +308,10 @@ class NewsDock(Gtk.Window):
         self.content_label.set_text("")
 
     def display_loading_message(self):
-        self.loading_label.set_text("Loading...")
+        pass
 
     def clear_loading_message(self, summary_content):
-        self.loading_label.set_text(summary_content)
+        pass
 
     def on_arrow_click(self, widget, section_key):
         self.display_loading_message()
@@ -535,23 +514,40 @@ class NewsDock(Gtk.Window):
         return content
 
     def on_realize(self, widget):
+        # Set strut if we have X11 support (XWayland counts too)
         if X11_AVAILABLE:
             window = self.get_window()
-            xid = window.get_xid()
-            self.set_strut(xid)
-        self.resize_to_fit_content()
+            if window:
+                try:
+                    xid = window.get_xid()
+                    self.set_strut(xid)
+                except Exception as e:
+                    print(f"Failed to get XID / set strut: {e}")
+
+        # Move/resize AFTER the window is realized and GNOME has computed workarea
+        GLib.idle_add(self.resize_to_fit_content)
+
 
     def resize_to_fit_content(self):
         display = Gdk.Display.get_default()
-        monitor = display.get_monitor(0) if display.get_primary_monitor() is None else display.get_primary_monitor()
-        
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
         if not monitor:
             return
-            
-        geometry = monitor.get_geometry()
-        preferred_height = self.get_preferred_height()[1]
-        self.set_default_size(geometry.width, preferred_height)
-        self.move(0, geometry.height - preferred_height)
+
+        # IMPORTANT: use workarea, not raw geometry
+        # workarea excludes top bar, dock, etc.
+        work = monitor.get_workarea()
+
+        pref_h = self.get_preferred_height()[1]
+
+        # Make window span the available width and fit content height
+        self.set_default_size(work.width, pref_h)
+
+        # Pin to bottom of workarea (true "bottom" GNOME will allow)
+        x = work.x
+        y = work.y + work.height - pref_h
+
+        self.move(x, y)
 
     def set_strut(self, xid):
         """Set _NET_WM_STRUT to reserve space at bottom of screen"""
