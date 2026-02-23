@@ -287,23 +287,13 @@ class NewsDock(Gtk.Window):
         self.news = self.fetch_news()
 
         for key, value in self.news.items():
-            hbox = Gtk.HBox(False, 2)
-
             title_text = value['title']
             title = Gtk.Label.new(f"{key}: {title_text}")
             title.set_line_wrap(False)
             title.set_halign(Gtk.Align.START)
 
-            button_read = Gtk.Button.new_with_label("->")
-            button_read.set_size_request(25, 25)
-            button_read.get_style_context().add_class("read-button")
-            button_read.connect("clicked", self.on_arrow_click, key)
-
-            hbox.pack_start(title, True, True, 0)
-            hbox.pack_start(button_read, False, False, 0)
-
-            # col 0 = news headlines
-            self.grid.attach(hbox, 0, row_number, 1, 1)
+            # col 0 = news headlines (no buttons)
+            self.grid.attach(title, 0, row_number, 1, 1)
             row_number += 1
 
         # col 1 = middle jobs panel, col 2 = right overflow panel
@@ -329,30 +319,30 @@ class NewsDock(Gtk.Window):
 
             for t in website_titles:
                 job_title = t[:55] + "..." if len(t) > 55 else t
-                all_lines.append(f"* {GLib.markup_escape_text(job_title)} (Website)")
+                all_lines.append(f"- {GLib.markup_escape_text(job_title)} (Website)")
 
             for t in intl_titles:
                 job_title = t[:55] + "..." if len(t) > 55 else t
-                all_lines.append(f"* {GLib.markup_escape_text(job_title)} (International relations)")
+                all_lines.append(f"- {GLib.markup_escape_text(job_title)} (International relations)")
 
             for t in econ_titles:
                 job_title = t[:55] + "..." if len(t) > 55 else t
-                all_lines.append(f"* {GLib.markup_escape_text(job_title)} (Economics)")
+                all_lines.append(f"- {GLib.markup_escape_text(job_title)} (Economics)")
 
             if not all_lines:
-                all_lines.append("* Not yet.")
+                all_lines.append("- Not yet.")
 
             # Split at JOBS_SPLIT
             middle_lines   = all_lines[:JOBS_SPLIT]
             overflow_lines = all_lines[JOBS_SPLIT:]
 
             # Middle panel (col 1) - always shown
-            middle_markup = "<b>Jobs (JobInRwanda)</b>\n" + "\n".join(middle_lines)
+            middle_markup = "\n".join(middle_lines)
             self.jobs_label.set_markup(middle_markup)
 
             # Right overflow panel (col 2) - shown only when there is overflow
             if overflow_lines:
-                overflow_markup = "<b>More Jobs</b>\n" + "\n".join(overflow_lines)
+                overflow_markup = "\n".join(overflow_lines)
                 self.jobs_overflow_label.set_markup(overflow_markup)
                 self.jobs_overflow_label.show()
             else:
