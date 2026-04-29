@@ -88,6 +88,11 @@ class NewsDock(Gtk.Window):
     def __init__(self):
         super().__init__()
 
+        self.drag_in_progress = False
+        self.drag_offset_x = 0
+        self.drag_offset_y = 0
+        self.current_monitor = None
+
         # HTTP session
         self.session = requests.Session()
         self.session.headers.update({
@@ -193,12 +198,8 @@ class NewsDock(Gtk.Window):
         self.set_skip_pager_hint(True)
         self.stick()
 
-        display = Gdk.Display.get_default()
-        monitor = (
-            display.get_monitor(0)
-            if display.get_primary_monitor() is None
-            else display.get_primary_monitor()
-        )
+        monitor = self.get_default_monitor()
+        self.current_monitor = monitor
         if monitor:
             geometry = monitor.get_geometry()
             self.set_default_size(geometry.width, -1)
@@ -238,6 +239,25 @@ class NewsDock(Gtk.Window):
         .read-button:hover {
             background-color: #2e3440;
         }
+        button.drag-handle {
+            background-color: transparent;
+            color: #2f3643;
+            min-width: 12px;
+            min-height: 12px;
+            padding: 0;
+        }
+        button.drag-handle:hover {
+            background-color: transparent;
+            color: #485264;
+        }
+        label.drag-handle-text {
+            color: #2f3643;
+            font-size: 8px;
+            font-weight: bold;
+        }
+        button.drag-handle:hover label.drag-handle-text {
+            color: #485264;
+        }
         """
         css_provider.load_from_data(css_data)
         screen = Gdk.Screen.get_default()
@@ -253,6 +273,38 @@ class NewsDock(Gtk.Window):
         self.grid.set_margin_bottom(5)
         self.grid.set_margin_start(10)
         self.grid.set_margin_end(10)
+
+        self.root_overlay = Gtk.Overlay()
+        self.drag_surface = Gtk.EventBox()
+        self.drag_surface.set_visible_window(False)
+        self.drag_surface.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+        )
+        self.drag_surface.connect("button-press-event", self.on_drag_handle_press)
+        self.drag_surface.connect("motion-notify-event", self.on_drag_handle_motion)
+        self.drag_surface.connect("button-release-event", self.on_drag_handle_release)
+
+        self.drag_button = Gtk.Button()
+        self.drag_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.drag_button.set_tooltip_text("Drag dock to another screen")
+        self.drag_button.set_halign(Gtk.Align.END)
+        self.drag_button.set_valign(Gtk.Align.START)
+        self.drag_button.set_margin_top(0)
+        self.drag_button.set_margin_end(2)
+        self.drag_button.get_style_context().add_class("drag-handle")
+        self.drag_label = Gtk.Label(label="::")
+        self.drag_label.get_style_context().add_class("drag-handle-text")
+        self.drag_button.add(self.drag_label)
+        self.drag_button.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+        )
+        self.drag_button.connect("button-press-event", self.on_drag_handle_press)
+        self.drag_button.connect("motion-notify-event", self.on_drag_handle_motion)
+        self.drag_button.connect("button-release-event", self.on_drag_handle_release)
 
         # Column 1 - middle jobs panel (first JOBS_SPLIT bullets)
         self.jobs_label = Gtk.Label()
@@ -274,7 +326,10 @@ class NewsDock(Gtk.Window):
         self.jobs_overflow_label.set_no_show_all(True)  # controlled manually
 
         self.add_news_to_grid()
-        self.add(self.grid)
+        self.drag_surface.add(self.grid)
+        self.root_overlay.add(self.drag_surface)
+        self.root_overlay.add_overlay(self.drag_button)
+        self.add(self.root_overlay)
 
     # -------------------------------------------------------------------------
     # Populate grid
@@ -589,41 +644,114 @@ class NewsDock(Gtk.Window):
     # -------------------------------------------------------------------------
     # Window positioning / strut
     # -------------------------------------------------------------------------
+    def get_default_monitor(self):
+        display = Gdk.Display.get_default()
+        if not display:
+            return None
+        return display.get_primary_monitor() or display.get_monitor(0)
+
+    def get_monitor_for_point(self, x_root, y_root):
+        display = Gdk.Display.get_default()
+        if not display:
+            return None
+
+        for monitor_index in range(display.get_n_monitors()):
+            monitor = display.get_monitor(monitor_index)
+            geometry = monitor.get_geometry()
+            if (
+                geometry.x <= x_root < geometry.x + geometry.width
+                and geometry.y <= y_root < geometry.y + geometry.height
+            ):
+                return monitor
+
+        return self.get_default_monitor()
+
+    def get_monitor_for_window(self):
+        x_pos, y_pos = self.get_position()
+        width, height = self.get_size()
+        center_x = x_pos + (width // 2)
+        center_y = y_pos + (height // 2)
+        return self.get_monitor_for_point(center_x, center_y)
+
     def on_realize(self, widget):
-        if X11_AVAILABLE:
-            window = self.get_window()
-            if window:
-                try:
-                    xid = window.get_xid()
-                    self.set_strut(xid)
-                except Exception as e:
-                    print(f"Failed to get XID / set strut: {e}")
         GLib.idle_add(self.resize_to_fit_content)
 
     def resize_to_fit_content(self):
-        display = Gdk.Display.get_default()
-        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        self.dock_to_monitor(self.current_monitor)
+        return False
+
+    def dock_to_monitor(self, monitor=None):
+        monitor = monitor or self.get_monitor_for_window() or self.get_default_monitor()
         if not monitor:
             return
-        work   = monitor.get_workarea()
+
+        self.current_monitor = monitor
+        work = monitor.get_workarea()
         pref_h = self.get_preferred_height()[1]
-        self.set_default_size(work.width, pref_h)
-        x = work.x
-        y = work.y + work.height - pref_h
-        self.move(x, y)
+        target_x = work.x
+        target_y = work.y + work.height - pref_h
 
-    def set_strut(self, xid):
-        display = Gdk.Display.get_default()
-        monitor = (
-            display.get_monitor(0)
-            if display.get_primary_monitor() is None
-            else display.get_primary_monitor()
+        self.set_default_size(work.width, pref_h)
+        self.set_size_request(work.width, pref_h)
+        self.root_overlay.set_size_request(work.width, pref_h)
+        self.drag_surface.set_size_request(work.width, pref_h)
+        self.resize(work.width, pref_h)
+        self.move(target_x, target_y)
+
+        window = self.get_window()
+        if window:
+            try:
+                window.move_resize(target_x, target_y, work.width, pref_h)
+            except Exception as e:
+                print(f"Failed to force window geometry: {e}")
+
+        if X11_AVAILABLE and window:
+            try:
+                self.set_strut(window.get_xid(), monitor, pref_h)
+            except Exception as e:
+                print(f"Failed to get XID / set strut: {e}")
+
+    def on_drag_handle_press(self, widget, event):
+        if event.button != Gdk.BUTTON_PRIMARY:
+            return False
+
+        win_x, win_y = self.get_position()
+        self.drag_in_progress = True
+        self.drag_offset_x = int(event.x_root) - win_x
+        self.drag_offset_y = int(event.y_root) - win_y
+        widget.grab_add()
+        return True
+
+    def on_drag_handle_motion(self, widget, event):
+        if not self.drag_in_progress:
+            return False
+        if not (event.state & Gdk.ModifierType.BUTTON1_MASK):
+            return False
+
+        self.move(
+            int(event.x_root) - self.drag_offset_x,
+            int(event.y_root) - self.drag_offset_y,
         )
+        return True
+
+    def on_drag_handle_release(self, widget, event):
+        if event.button != Gdk.BUTTON_PRIMARY or not self.drag_in_progress:
+            return False
+
+        self.drag_in_progress = False
+        widget.grab_remove()
+        self.dock_to_monitor(
+            self.get_monitor_for_point(int(event.x_root), int(event.y_root))
+        )
+        return True
+
+    def set_strut(self, xid, monitor, preferred_height=None):
         if not monitor:
             return
 
-        geometry         = monitor.get_geometry()
-        preferred_height = self.get_preferred_height()[1]
+        geometry = monitor.get_geometry()
+        preferred_height = preferred_height or self.get_preferred_height()[1]
+        bottom_end_x = geometry.x + geometry.width - 1
 
         # _NET_WM_STRUT_PARTIAL: left, right, top, bottom + 8 range values
         data = [
@@ -631,7 +759,7 @@ class NewsDock(Gtk.Window):
             0, 0,
             0, 0,
             0, 0,
-            0, geometry.width,
+            geometry.x, bottom_end_x,
         ]
         try:
             subprocess.run(
