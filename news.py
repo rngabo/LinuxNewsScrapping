@@ -31,15 +31,58 @@ except ImportError:
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# How many job bullets stay in the middle panel before the rest spill to the right panel
-JOBS_SPLIT = 5
+# Four one-line entries match the four headline rows which define the dock height.
+DEFAULT_JOBS_PER_COLUMN = 4
+DEFAULT_JOBS_PER_PAGE_WITH_LINK = (DEFAULT_JOBS_PER_COLUMN * 2) - 1
+TECH_JOBS_PER_COLUMN = 4
+DEFAULT_JOB_LINE_CHARS = 58
+TECH_RIGHT_LINE_CHARS = 46
+TECH_MIDDLE_LINE_CHARS = 92
+
+
+def compact_job_text(text, max_chars):
+    """Shorten only the position, preserving trailing parenthetical details."""
+    text = " ".join(text.split())
+    details_start = len(text)
+    cursor = len(text)
+    while cursor and text[cursor - 1] == ")":
+        depth = 0
+        opening = None
+        for index in range(cursor - 1, -1, -1):
+            if text[index] == ")":
+                depth += 1
+            elif text[index] == "(":
+                depth -= 1
+                if depth == 0:
+                    opening = index
+                    break
+        if opening is None or (opening and not text[opening - 1].isspace()):
+            break
+        details_start = opening
+        cursor = opening
+        while cursor and text[cursor - 1].isspace():
+            cursor -= 1
+    title = text[:cursor].rstrip()
+    details = text[details_start:].strip() if details_start < len(text) else ""
+    available = max(8, max_chars - len(details) - (1 if details else 0))
+    if len(title) > available:
+        cut = title[:max(1, available - 1)].rstrip()
+        word_cut = cut.rsplit(" ", 1)[0]
+        if len(word_cut) >= max(8, available // 2):
+            cut = word_cut
+        title = cut + "…"
+    return f"{title} {details}".rstrip()
+
+
+def job_markup(text, max_chars):
+    return f"- {GLib.markup_escape_text(compact_job_text(text, max_chars))}"
 
 
 # -----------------------------------------------------------------------------
 # JobInRwanda scraper
 # -----------------------------------------------------------------------------
-def scrape_jobinrwanda_titles(session, url, limit=12, include_employer=False):
-    """Return titles with optional employers; limit=None includes every page."""
+def scrape_jobinrwanda_titles(session, url, limit=12, include_employer=False, category_label=None):
+    """Return titles with optional category/employer; limit=None includes every page."""
     headers = {"User-Agent": "Mozilla/5.0"}
     titles = []
     visited = set()
@@ -52,6 +95,8 @@ def scrape_jobinrwanda_titles(session, url, limit=12, include_employer=False):
             title_span = article.find("span", class_="field--name-title")
             if title_span:
                 title = title_span.get_text(" ", strip=True)
+                if category_label:
+                    title += f" ({category_label})"
                 if include_employer:
                     employer_link = article.select_one('a[href*="/employer/"]')
                     employer = employer_link.get_text(" ", strip=True) if employer_link else ""
@@ -104,6 +149,8 @@ class NewsDock(Gtk.Window):
         super().__init__()
 
         self.drag_in_progress = False
+        self.drag_grab_widget = None
+        self.drag_watch_source = None
         self.drag_offset_x = 0
         self.drag_offset_y = 0
         self.current_monitor = None
@@ -111,8 +158,11 @@ class NewsDock(Gtk.Window):
         self.closed = False
         self.news_loading = False
         self.jobs_loading = False
+        self.default_job_titles = []
+        self.default_jobs_page = 0
         self.refresh_timer_source = None
         self.connect("destroy", self.on_destroy)
+        self.connect("unmap", self.cancel_drag)
 
         # HTTP session
         self.session = requests.Session()
@@ -171,6 +221,7 @@ class NewsDock(Gtk.Window):
 
     def on_destroy(self, widget):
         self.closed = True
+        self.cancel_drag()
         for source in (self.refresh_timer_source, self.it_layout_source):
             if source:
                 GLib.source_remove(source)
@@ -280,6 +331,18 @@ class NewsDock(Gtk.Window):
         button.it-jobs-toggle:hover {
             background: #1a1f28;
         }
+        button.jobs-read-more {
+            background: transparent;
+            padding: 0px;
+            min-width: 0px;
+            min-height: 0px;
+            color: #88c0d0;
+            text-decoration: underline;
+        }
+        button.jobs-read-more:hover {
+            background: transparent;
+            color: #8fbcbb;
+        }
         .it-jobs-panel {
             border-left: 1px solid #485264;
         }
@@ -336,6 +399,7 @@ class NewsDock(Gtk.Window):
         self.drag_surface.connect("button-press-event", self.on_drag_handle_press)
         self.drag_surface.connect("motion-notify-event", self.on_drag_handle_motion)
         self.drag_surface.connect("button-release-event", self.on_drag_handle_release)
+        self.drag_surface.connect("grab-broken-event", self.on_drag_interrupted)
 
         self.drag_button = Gtk.Button()
         self.drag_button.set_relief(Gtk.ReliefStyle.NONE)
@@ -356,36 +420,62 @@ class NewsDock(Gtk.Window):
         self.drag_button.connect("button-press-event", self.on_drag_handle_press)
         self.drag_button.connect("motion-notify-event", self.on_drag_handle_motion)
         self.drag_button.connect("button-release-event", self.on_drag_handle_release)
+        self.drag_button.connect("grab-broken-event", self.on_drag_interrupted)
 
-        # Column 1 - middle jobs panel (first JOBS_SPLIT bullets)
+        # Default jobs use one line per item. Four lines are the hard vertical
+        # budget because the four news headlines define the dock's height.
         self.jobs_label = Gtk.Label()
         self.jobs_label.set_line_wrap(False)
         self.jobs_label.set_valign(Gtk.Align.START)
-        self.jobs_label.set_halign(Gtk.Align.START)
+        self.jobs_label.set_halign(Gtk.Align.FILL)
+        self.jobs_label.set_xalign(0)
         self.jobs_label.set_margin_start(20)
         self.jobs_label.set_max_width_chars(40)
-        self.jobs_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.jobs_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self.jobs_label.set_hexpand(True)
-        self.jobs_label.set_markup("<b>Jobs (JobInRwanda)</b>\nLoading...")
+        self.jobs_label.set_markup("Loading...")
 
-        # Column 2 - right overflow panel (bullets beyond JOBS_SPLIT)
+        # The second default column receives entries only after the first fills.
         self.jobs_overflow_label = Gtk.Label()
         self.jobs_overflow_label.set_line_wrap(False)
         self.jobs_overflow_label.set_valign(Gtk.Align.START)
         self.jobs_overflow_label.set_halign(Gtk.Align.START)
-        self.jobs_overflow_label.set_margin_start(10)
+        self.jobs_overflow_label.set_xalign(0)
         self.jobs_overflow_label.set_max_width_chars(40)
-        self.jobs_overflow_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.jobs_overflow_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self.jobs_overflow_label.set_hexpand(True)
         self.jobs_overflow_label.set_markup("")
         self.jobs_overflow_label.set_no_show_all(True)  # controlled manually
+
+        self.jobs_read_more = Gtk.Button()
+        self.jobs_read_more_label = Gtk.Label()
+        self.jobs_read_more_label.set_markup("<u>(read more)</u>")
+        self.jobs_read_more.add(self.jobs_read_more_label)
+        self.jobs_read_more.set_relief(Gtk.ReliefStyle.NONE)
+        self.jobs_read_more.set_halign(Gtk.Align.START)
+        self.jobs_read_more.set_valign(Gtk.Align.START)
+        self.jobs_read_more.get_style_context().add_class("jobs-read-more")
+        self.jobs_read_more.set_tooltip_text("Show the next job listings")
+        self.jobs_read_more.set_no_show_all(True)
+        self.jobs_read_more.connect("clicked", self.on_jobs_read_more)
+        self.jobs_read_more.hide()
+
+        self.default_jobs_overflow_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.default_jobs_overflow_box.set_margin_start(10)
+        self.default_jobs_overflow_box.pack_start(
+            self.jobs_overflow_label, False, False, 0
+        )
+        self.default_jobs_overflow_box.pack_start(
+            self.jobs_read_more, False, False, 0
+        )
 
         # Keep the normal middle listings underneath an optional IT view, so
         # switching categories preserves their layout and restores them instantly.
         self.default_jobs_grid = Gtk.Grid()
         self.default_jobs_grid.set_column_spacing(20)
+        self.default_jobs_grid.set_column_homogeneous(True)
         self.default_jobs_grid.attach(self.jobs_label, 0, 0, 1, 1)
-        self.default_jobs_grid.attach(self.jobs_overflow_label, 1, 0, 1, 1)
+        self.default_jobs_grid.attach(self.default_jobs_overflow_box, 1, 0, 1, 1)
         self.middle_jobs_area = Gtk.Overlay()
         self.middle_jobs_area.add(self.default_jobs_grid)
 
@@ -393,11 +483,14 @@ class NewsDock(Gtk.Window):
         self.it_jobs_middle_panel.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.it_jobs_middle_panel.set_propagate_natural_width(False)
         self.it_jobs_middle_panel.set_propagate_natural_height(False)
+        self.it_jobs_middle_panel.set_halign(Gtk.Align.END)
+        self.it_jobs_middle_panel.set_hexpand(False)
         self.jobs_it_middle_label = Gtk.Label()
-        self.jobs_it_middle_label.set_line_wrap(True)
-        self.jobs_it_middle_label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.jobs_it_middle_label.set_line_wrap(False)
         self.jobs_it_middle_label.set_valign(Gtk.Align.START)
+        self.jobs_it_middle_label.set_halign(Gtk.Align.FILL)
         self.jobs_it_middle_label.set_xalign(0)
+        self.jobs_it_middle_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self.jobs_it_middle_label.set_margin_start(20)
         self.jobs_it_middle_label.set_margin_end(10)
         self.it_jobs_middle_panel.add(self.jobs_it_middle_label)
@@ -424,8 +517,7 @@ class NewsDock(Gtk.Window):
         self.it_jobs_panel.get_style_context().add_class("it-jobs-panel")
 
         self.jobs_it_label = Gtk.Label()
-        self.jobs_it_label.set_line_wrap(True)
-        self.jobs_it_label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.jobs_it_label.set_line_wrap(False)
         self.jobs_it_label.set_valign(Gtk.Align.START)
         self.jobs_it_label.set_halign(Gtk.Align.FILL)
         self.jobs_it_label.set_xalign(0)
@@ -434,6 +526,7 @@ class NewsDock(Gtk.Window):
         # Leave room beside the text for the floating button inside this column.
         self.jobs_it_label.set_margin_end(60)
         self.jobs_it_label.set_max_width_chars(40)
+        self.jobs_it_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self.jobs_it_label.set_text("Loading...")
         self.jobs_it_label.set_no_show_all(True)
         self.jobs_it_label.hide()
@@ -442,19 +535,21 @@ class NewsDock(Gtk.Window):
         self.it_jobs_toggle = Gtk.Button(label="Show")
         self.it_jobs_toggle.set_halign(Gtk.Align.END)
         self.it_jobs_toggle.set_valign(Gtk.Align.END)
-        # Float over the IT column, outside the EventBox that handles dragging.
+        # Keep the control inside the IT column's own overlay. This gives it a
+        # stable input area even when the dock is resized or moved.
         self.it_jobs_toggle.set_margin_end(20)
         self.it_jobs_toggle.set_margin_bottom(10)
         self.it_jobs_toggle.get_style_context().add_class("it-jobs-toggle")
         self.it_jobs_toggle.set_tooltip_text("Show or hide IT jobs")
         self.it_jobs_toggle.connect("clicked", self.on_it_jobs_toggle)
         self.it_jobs_column.add(self.it_jobs_panel)
+        self.it_jobs_column.add_overlay(self.it_jobs_toggle)
+        self.it_jobs_column.set_overlay_pass_through(self.it_jobs_toggle, False)
 
         self.add_news_to_grid()
         self.drag_surface.add(self.grid)
         self.root_overlay.add(self.drag_surface)
         self.root_overlay.add_overlay(self.drag_button)
-        self.root_overlay.add_overlay(self.it_jobs_toggle)
         self.add(self.root_overlay)
 
     # -------------------------------------------------------------------------
@@ -496,65 +591,67 @@ class NewsDock(Gtk.Window):
         threading.Thread(target=self.fetch_jobs, daemon=True).start()
 
     def fetch_jobs(self):
-        all_lines = None
+        titles = None
         try:
             with requests.Session() as session:
                 session.headers.update(self.session.headers)
-                website_titles = scrape_jobinrwanda_titles(session, self.jobs_url, limit=6)
-                intl_titles = scrape_jobinrwanda_titles(session, self.jobs_international_url, limit=6)
-                econ_titles = scrape_jobinrwanda_titles(session, self.jobs_economics_url, limit=6)
-
-            all_lines = []
-
-            for t in website_titles:
-                job_title = t[:55] + "..." if len(t) > 55 else t
-                all_lines.append(f"- {GLib.markup_escape_text(job_title)} (Website)")
-
-            for t in intl_titles:
-                job_title = t[:55] + "..." if len(t) > 55 else t
-                all_lines.append(f"- {GLib.markup_escape_text(job_title)} (International relations)")
-
-            for t in econ_titles:
-                job_title = t[:55] + "..." if len(t) > 55 else t
-                all_lines.append(f"- {GLib.markup_escape_text(job_title)} (Economics)")
-
-            if not all_lines:
-                all_lines.append("- Not yet.")
+                titles = []
+                for url, category in (
+                    (self.jobs_url, "Website"),
+                    (self.jobs_international_url, "International relations"),
+                    (self.jobs_economics_url, "Economics"),
+                ):
+                    titles.extend(scrape_jobinrwanda_titles(
+                        session, url, limit=6, include_employer=True, category_label=category
+                    ))
+            if not titles:
+                titles.append("Not yet.")
 
         except Exception as e:
+            titles = None
             print(f"Error fetching JobInRwanda jobs: {e}")
-        GLib.idle_add(self.update_jobs_panel, all_lines)
+        GLib.idle_add(self.update_jobs_panel, titles)
 
-    def update_jobs_panel(self, all_lines):
+    def update_jobs_panel(self, titles):
         self.jobs_loading = False
         if self.closed:
             return False
-        if all_lines is not None:
-            # Split at JOBS_SPLIT
-            middle_lines   = all_lines[:JOBS_SPLIT]
-            overflow_lines = all_lines[JOBS_SPLIT:]
-
-            # Middle panel (col 1) - always shown
-            middle_markup = "\n".join(middle_lines)
-            self.jobs_label.set_markup(middle_markup)
-
-            # Right overflow panel (col 2) - shown only when there is overflow
-            if overflow_lines:
-                overflow_markup = "\n".join(overflow_lines)
-                self.jobs_overflow_label.set_markup(overflow_markup)
-                self.jobs_overflow_label.show()
-            else:
-                self.jobs_overflow_label.set_markup("")
-                self.jobs_overflow_label.hide()
-
+        self.default_jobs_page = 0
+        if titles is not None:
+            self.default_job_titles = titles
         else:
-            self.jobs_label.set_markup("<b>Jobs (JobInRwanda)</b>\nFailed to load.")
-            self.jobs_overflow_label.set_markup("")
-            self.jobs_overflow_label.hide()
+            self.default_job_titles = ["Failed to load."]
+        self.render_default_jobs_page()
 
-        GLib.idle_add(self.resize_to_fit_content)
         self.queue_it_jobs_layout()
         return False
+
+    def render_default_jobs_page(self):
+        start = self.default_jobs_page * DEFAULT_JOBS_PER_PAGE_WITH_LINK
+        remaining = self.default_job_titles[start:]
+        has_more = len(remaining) > DEFAULT_JOBS_PER_COLUMN * 2
+        visible_count = (
+            DEFAULT_JOBS_PER_PAGE_WITH_LINK
+            if has_more else DEFAULT_JOBS_PER_COLUMN * 2
+        )
+        visible = remaining[:visible_count]
+        middle = visible[:DEFAULT_JOBS_PER_COLUMN]
+        overflow = visible[DEFAULT_JOBS_PER_COLUMN:]
+
+        self.jobs_label.set_markup("\n".join(
+            job_markup(title, DEFAULT_JOB_LINE_CHARS) for title in middle
+        ))
+        self.jobs_overflow_label.set_markup("\n".join(
+            job_markup(title, DEFAULT_JOB_LINE_CHARS) for title in overflow
+        ))
+        self.jobs_overflow_label.set_visible(bool(overflow))
+        self.jobs_read_more.set_visible(has_more)
+
+    def on_jobs_read_more(self, button):
+        next_start = (self.default_jobs_page + 1) * DEFAULT_JOBS_PER_PAGE_WITH_LINK
+        if next_start < len(self.default_job_titles):
+            self.default_jobs_page += 1
+            self.render_default_jobs_page()
 
     def on_it_jobs_toggle(self, button):
         visible = not self.jobs_it_label.get_visible()
@@ -603,15 +700,8 @@ class NewsDock(Gtk.Window):
             self.it_layout_source = GLib.idle_add(self.layout_it_jobs)
 
     @staticmethod
-    def format_it_jobs(titles):
-        return "\n".join(f"- {GLib.markup_escape_text(title)}" for title in titles)
-
-    def it_text_height(self, label, markup, width):
-        layout = label.create_pango_layout("")
-        layout.set_markup(markup, -1)
-        layout.set_width(max(1, width) * Pango.SCALE)
-        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
-        return layout.get_pixel_size()[1]
+    def format_it_jobs(titles, max_chars):
+        return "\n".join(job_markup(title, max_chars) for title in titles)
 
     def set_it_columns(self, right_markup, middle_markup=None):
         # Opacity keeps the default listings' size reserved without exposing
@@ -630,50 +720,29 @@ class NewsDock(Gtk.Window):
         if self.closed or not self.jobs_it_label.get_visible():
             return False
 
-        right_width = self.it_jobs_column.get_allocated_width() - 86
-        available_height = self.it_jobs_column.get_allocated_height() - 2
-        middle_width = self.middle_jobs_area.get_allocated_width() - 46
-        layout_key = (tuple(self.it_job_titles), self.it_jobs_message,
-                      right_width, available_height, middle_width)
+        layout_key = (tuple(self.it_job_titles), self.it_jobs_message)
         if layout_key == self.it_layout_key:
             return False
         self.it_layout_key = layout_key
 
-        full_markup = self.format_it_jobs(self.it_job_titles)
+        # Up to four entries live only in the last column. Once the list needs
+        # both columns, lay it out in natural left-to-right reading order and
+        # keep at least four entries in the middle before continuing right.
+        if len(self.it_job_titles) <= TECH_JOBS_PER_COLUMN:
+            middle_titles = []
+            right_titles = self.it_job_titles
+        else:
+            middle_count = max(
+                TECH_JOBS_PER_COLUMN,
+                (len(self.it_job_titles) + 1) // 2,
+            )
+            middle_titles = self.it_job_titles[:middle_count]
+            right_titles = self.it_job_titles[middle_count:]
+        right = self.format_it_jobs(right_titles, TECH_RIGHT_LINE_CHARS)
+        middle = self.format_it_jobs(middle_titles, TECH_MIDDLE_LINE_CHARS)
         if self.it_jobs_message:
-            full_markup += ("\n" if full_markup else "") + GLib.markup_escape_text(self.it_jobs_message)
-        # Account for text margins and a scrollbar without changing dock size.
-        full_height = self.it_text_height(self.jobs_it_label, full_markup, right_width)
-        if not self.it_job_titles or full_height <= available_height:
-            self.set_it_columns(full_markup)
-            return False
-
-        # Heights change monotonically as jobs move between columns. Search
-        # the balance point instead of measuring every possible full-list split.
-        measured = {}
-
-        def measure_split(split):
-            if split in measured:
-                return measured[split]
-            middle = self.format_it_jobs(self.it_job_titles[:split])
-            right = self.format_it_jobs(self.it_job_titles[split:])
-            middle_height = self.it_text_height(self.jobs_it_middle_label, middle, middle_width)
-            right_height = self.it_text_height(self.jobs_it_label, right, right_width)
-            score = (max(middle_height, right_height), abs(middle_height - right_height))
-            measured[split] = (score, right, middle, middle_height, right_height)
-            return measured[split]
-
-        low, high = 1, len(self.it_job_titles)
-        while low < high:
-            split = (low + high) // 2
-            result = measure_split(split)
-            if result[3] < result[4]:
-                low = split + 1
-            else:
-                high = split
-        candidates = [measure_split(low), measure_split(max(1, low - 1))]
-        best_split = min(candidates, key=lambda result: result[0])
-        self.set_it_columns(best_split[1], best_split[2])
+            right += ("\n" if right else "") + GLib.markup_escape_text(self.it_jobs_message)
+        self.set_it_columns(right, middle or None)
         return False
 
     # -------------------------------------------------------------------------
@@ -961,6 +1030,27 @@ class NewsDock(Gtk.Window):
             self.dock_to_monitor(self.current_monitor)
         return False
 
+    def headline_height(self):
+        labels = list(self.headline_labels.values())
+        content_height = sum(label.get_preferred_height()[1] for label in labels)
+        spacing = self.grid.get_row_spacing() * max(0, len(labels) - 1)
+        return (
+            self.grid.get_margin_top()
+            + content_height
+            + spacing
+            + self.grid.get_margin_bottom()
+        )
+
+    def size_job_columns(self, work_width):
+        margins = self.grid.get_margin_start() + self.grid.get_margin_end()
+        spacing = self.grid.get_column_spacing()
+        usable_width = max(1, work_width - margins - (spacing * 3))
+        column_width = max(120, usable_width // 4)
+        middle_width = (column_width * 2) + spacing
+        self.middle_jobs_area.set_size_request(middle_width, -1)
+        self.it_jobs_middle_panel.set_size_request(column_width, -1)
+        self.it_jobs_column.set_size_request(column_width, -1)
+
     def dock_to_monitor(self, monitor=None):
         monitor = monitor or self.get_monitor_for_window() or self.get_default_monitor()
         if not monitor:
@@ -972,7 +1062,10 @@ class NewsDock(Gtk.Window):
             self.dock_workarea = monitor.get_workarea()
         self.current_monitor = monitor
         work = self.dock_workarea
-        pref_h = self.grid.get_preferred_height()[1]
+        self.size_job_columns(work.width)
+        # The four headlines are the sole authority for dock height. Job lists
+        # are paged or contained and must never participate in this value.
+        pref_h = self.headline_height()
         target_x = work.x
         target_y = work.y + work.height - pref_h
 
@@ -1006,17 +1099,54 @@ class NewsDock(Gtk.Window):
                     return False
                 target = target.get_parent()
 
+        self.cancel_drag()
         win_x, win_y = self.get_position()
         self.drag_in_progress = True
+        self.drag_grab_widget = widget
         self.drag_offset_x = int(event.x_root) - win_x
         self.drag_offset_y = int(event.y_root) - win_y
         widget.grab_add()
+        # A release can be lost when the compositor interrupts a drag. Keep a
+        # grab only while the physical button is down, so Show stays clickable.
+        self.drag_watch_source = GLib.timeout_add(100, self.check_drag_button)
+        return True
+
+    def cancel_drag(self, *args):
+        self.drag_in_progress = False
+        widget = self.drag_grab_widget
+        self.drag_grab_widget = None
+        if widget is not None and widget.has_grab():
+            widget.grab_remove()
+        if self.drag_watch_source is not None:
+            GLib.source_remove(self.drag_watch_source)
+            self.drag_watch_source = None
+        return False
+
+    def finish_drag(self, monitor=None):
+        if not self.drag_in_progress:
+            return
+        self.cancel_drag()
+        if not self.closed and self.get_mapped():
+            self.dock_to_monitor(monitor or self.get_monitor_for_window())
+
+    def on_drag_interrupted(self, widget, event):
+        self.finish_drag()
+        return False
+
+    def check_drag_button(self):
+        pointer = self.get_display().get_default_seat().get_pointer()
+        state = self.get_screen().get_root_window().get_device_position(pointer)[3]
+        if not (state & Gdk.ModifierType.BUTTON1_MASK):
+            self.drag_watch_source = None
+            self.finish_drag()
+            return False
         return True
 
     def on_drag_handle_motion(self, widget, event):
         if not self.drag_in_progress:
             return False
         if not (event.state & Gdk.ModifierType.BUTTON1_MASK):
+            self.finish_drag()
             return False
 
         self.move(
@@ -1029,9 +1159,7 @@ class NewsDock(Gtk.Window):
         if event.button != Gdk.BUTTON_PRIMARY or not self.drag_in_progress:
             return False
 
-        self.drag_in_progress = False
-        widget.grab_remove()
-        self.dock_to_monitor(
+        self.finish_drag(
             self.get_monitor_for_point(int(event.x_root), int(event.y_root))
         )
         return True
