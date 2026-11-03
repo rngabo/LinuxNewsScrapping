@@ -326,6 +326,8 @@ class NewsDock(Gtk.Window):
             "?filter_titles_field=&field_job_category_target_id=33"
         )
         self.it_jobs_loading = False
+        self.it_jobs_visible = False
+        self.it_jobs_middle_active = False
         self.it_job_titles = []
         self.it_jobs_message = "Loading..."
         self.it_layout_source = None
@@ -361,7 +363,7 @@ class NewsDock(Gtk.Window):
         LOGGER.info(
             "window_destroy full_titles=%s it_visible=%s drag_active=%s",
             self.full_job_text,
-            self.jobs_it_label.get_visible(),
+            self.it_jobs_visible,
             self.drag_in_progress,
         )
         self.closed = True
@@ -519,6 +521,10 @@ class NewsDock(Gtk.Window):
             background-image: none;
             box-shadow: none;
         }
+        scrolledwindow.jobs-scroll-panel,
+        scrolledwindow.jobs-scroll-panel viewport {
+            background: transparent;
+        }
         .read-button {
             background: #242933;
             margin-left: 15px;
@@ -640,7 +646,7 @@ class NewsDock(Gtk.Window):
         self.it_jobs_middle_panel.set_propagate_natural_width(False)
         self.it_jobs_middle_panel.set_propagate_natural_height(False)
         self.it_jobs_middle_panel.set_halign(Gtk.Align.END)
-        self.it_jobs_middle_panel.set_hexpand(False)
+        self.it_jobs_middle_panel.set_hexpand(True)
         self.it_jobs_middle_panel.set_vexpand(True)
         self.it_jobs_middle_panel.set_valign(Gtk.Align.FILL)
         self.it_jobs_middle_panel.get_style_context().add_class("jobs-scroll-panel")
@@ -654,8 +660,7 @@ class NewsDock(Gtk.Window):
         self.jobs_it_middle_label.set_margin_end(10)
         self.it_jobs_middle_panel.add(self.jobs_it_middle_label)
         self.it_jobs_middle_panel.show_all()
-        self.it_jobs_middle_panel.set_no_show_all(True)
-        self.it_jobs_middle_panel.hide()
+        self.it_jobs_middle_panel.set_sensitive(False)
 
         # A lone END-aligned overlay child can retain a 1x1 allocation after
         # Mutter/XWayland moves the dock between differently sized monitors.
@@ -704,9 +709,7 @@ class NewsDock(Gtk.Window):
         self.jobs_it_label.set_margin_end(60)
         self.jobs_it_label.set_max_width_chars(40)
         self.jobs_it_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
-        self.jobs_it_label.set_text("Loading...")
-        self.jobs_it_label.set_no_show_all(True)
-        self.jobs_it_label.hide()
+        self.jobs_it_label.set_text("")
         self.it_jobs_panel.add(self.jobs_it_label)
 
         self.it_jobs_toggle = Gtk.Button(label="Show")
@@ -1111,7 +1114,7 @@ class NewsDock(Gtk.Window):
             return False
 
         waiting_for_it = (
-            self.jobs_it_label.get_visible()
+            self.it_jobs_visible
             and self.it_jobs_message == "Loading..."
             and not self.it_job_titles
         )
@@ -1172,7 +1175,7 @@ class NewsDock(Gtk.Window):
         }
         it_middle_count = 0
         it_right_count = 0
-        if self.jobs_it_label.get_visible():
+        if self.it_jobs_visible:
             expected_middle, expected_right, it_middle_count, it_right_count = (
                 self.expected_it_column_text()
             )
@@ -1194,7 +1197,7 @@ class NewsDock(Gtk.Window):
                 "it_middle_text": self.jobs_it_middle_label.get_text() == expected_middle,
                 "it_right_text": self.jobs_it_label.get_text() == expected_right,
                 "it_middle_visible": (
-                    self.it_jobs_middle_panel.get_visible() == bool(expected_middle)
+                    self.it_jobs_middle_active == bool(expected_middle)
                 ),
             })
             checks["it_data_available"] = not bool(
@@ -1362,10 +1365,8 @@ class NewsDock(Gtk.Window):
             ))
         checks = {
             "button": self.it_jobs_toggle.get_label() == "Hide",
-            "right_visible": self.jobs_it_label.get_visible(),
-            "middle_visible": (
-                self.it_jobs_middle_panel.get_visible() == expects_middle
-            ),
+            "right_visible": self.it_jobs_visible,
+            "middle_visible": self.it_jobs_middle_active == expects_middle,
             "default_opacity": (
                 self.default_jobs_grid.get_opacity() == (0 if expects_middle else 1)
             ),
@@ -1435,8 +1436,8 @@ class NewsDock(Gtk.Window):
                 middle_count,
                 right_count,
                 self.full_job_text,
-                self.jobs_it_label.get_visible(),
-                self.it_jobs_middle_panel.get_visible(),
+                self.it_jobs_visible,
+                self.it_jobs_middle_active,
                 latency_ms,
                 window_geometry,
                 viewport_metrics,
@@ -1480,8 +1481,8 @@ class NewsDock(Gtk.Window):
         ]
         checks = {
             "button": self.it_jobs_toggle.get_label() == "Show",
-            "right_hidden": not self.jobs_it_label.get_visible(),
-            "middle_hidden": not self.it_jobs_middle_panel.get_visible(),
+            "right_hidden": not self.it_jobs_visible and not self.jobs_it_label.get_text(),
+            "middle_hidden": not self.it_jobs_middle_active,
             "defaults_visible": self.default_jobs_grid.get_opacity() == 1,
             "defaults_sensitive": self.default_jobs_grid.get_sensitive(),
             "default_middle_text": self.jobs_label.get_text() == default_middle,
@@ -1571,7 +1572,7 @@ class NewsDock(Gtk.Window):
             action_id,
             "full" if self.full_job_text else "short",
             button.get_label(),
-            self.jobs_it_label.get_visible(),
+            self.it_jobs_visible,
         )
         for label in (
             self.jobs_label,
@@ -1607,8 +1608,8 @@ class NewsDock(Gtk.Window):
                 self.action_latency_ms(superseded, finish=True),
             )
         action_id = self.next_action_id()
-        visible = not self.jobs_it_label.get_visible()
-        self.jobs_it_label.set_visible(visible)
+        visible = not self.it_jobs_visible
+        self.it_jobs_visible = visible
         button.set_label("Hide" if visible else "Show")
         button.set_tooltip_text("Hide IT jobs" if visible else "Show IT jobs")
         LOGGER.info(
@@ -1632,7 +1633,7 @@ class NewsDock(Gtk.Window):
         else:
             self.cancel_it_show_verification(result="superseded")
             self.it_layout_key = None
-            self.set_it_columns(self.jobs_it_label.get_label())
+            self.set_it_columns("")
             self.queue_resize()
             self.queue_draw()
             self.schedule_it_hide_confirmation(action_id)
@@ -1645,7 +1646,7 @@ class NewsDock(Gtk.Window):
             LOGGER.info("it_jobs_refresh_skipped reason=already-loading")
             return
         self.it_jobs_loading = True
-        LOGGER.info("it_jobs_refresh_started visible=%s", self.jobs_it_label.get_visible())
+        LOGGER.info("it_jobs_refresh_started visible=%s", self.it_jobs_visible)
         threading.Thread(
             target=self.fetch_it_jobs,
             daemon=True,
@@ -1685,13 +1686,13 @@ class NewsDock(Gtk.Window):
             "it_jobs_result_applied count=%d message=%r visible=%s",
             len(titles),
             message,
-            self.jobs_it_label.get_visible(),
+            self.it_jobs_visible,
         )
         self.queue_it_jobs_layout()
         return False
 
     def queue_it_jobs_layout(self, *args):
-        if not self.closed and self.jobs_it_label.get_visible() and self.it_layout_source is None:
+        if not self.closed and self.it_jobs_visible and self.it_layout_source is None:
             self.it_layout_source = GLib.idle_add(self.layout_it_jobs)
 
     @staticmethod
@@ -1701,9 +1702,11 @@ class NewsDock(Gtk.Window):
     def set_it_columns(self, right_markup, middle_markup=None):
         # Opacity keeps the default listings' size reserved without exposing
         # their text underneath IT. They continue refreshing while covered.
-        self.default_jobs_grid.set_opacity(0 if middle_markup else 1)
-        self.default_jobs_grid.set_sensitive(not bool(middle_markup))
-        self.it_jobs_middle_panel.set_visible(bool(middle_markup))
+        show_middle = self.it_jobs_visible and bool(middle_markup)
+        self.it_jobs_middle_active = show_middle
+        self.default_jobs_grid.set_opacity(0 if show_middle else 1)
+        self.default_jobs_grid.set_sensitive(not show_middle)
+        self.it_jobs_middle_panel.set_sensitive(show_middle)
         for label, markup in (
             (self.jobs_it_label, right_markup),
             (self.jobs_it_middle_label, middle_markup or ""),
@@ -1717,7 +1720,7 @@ class NewsDock(Gtk.Window):
 
     def layout_it_jobs(self):
         self.it_layout_source = None
-        if self.closed or not self.jobs_it_label.get_visible():
+        if self.closed or not self.it_jobs_visible:
             return False
 
         layout_key = (
@@ -1827,7 +1830,7 @@ class NewsDock(Gtk.Window):
             self.update_counter + 1,
             self.news_loading,
             self.jobs_loading,
-            self.jobs_it_label.get_visible(),
+            self.it_jobs_visible,
             self.it_jobs_loading,
         )
         if not self.news_loading:
@@ -1839,7 +1842,7 @@ class NewsDock(Gtk.Window):
                 name="news-fetch",
             ).start()
         self.refresh_jobs_panel()
-        if self.jobs_it_label.get_visible():
+        if self.it_jobs_visible:
             self.refresh_it_jobs_panel()
         return True
 
