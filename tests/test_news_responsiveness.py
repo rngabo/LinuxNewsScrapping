@@ -480,6 +480,14 @@ class NewsResponsivenessTests(unittest.TestCase):
                             window.jobs_it_middle_label.get_allocated_width(),
                             80,
                         )
+                        self.assertGreater(
+                            window.jobs_it_middle_label.get_allocated_height(),
+                            20,
+                        )
+                        self.assertGreater(
+                            window.jobs_it_label.get_allocated_height(),
+                            20,
+                        )
                     else:
                         self.assertEqual(window.jobs_it_label.get_text(), "")
                         self.assertEqual(window.jobs_it_middle_label.get_text(), "")

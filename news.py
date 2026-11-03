@@ -332,6 +332,7 @@ class NewsDock(Gtk.Window):
         self.it_jobs_message = "Loading..."
         self.it_layout_source = None
         self.it_layout_key = None
+        self.it_viewport_sync_source = None
 
         self.jobs = []
         self.update_counter = 0
@@ -371,6 +372,7 @@ class NewsDock(Gtk.Window):
         for source in (
             self.refresh_timer_source,
             self.it_layout_source,
+            self.it_viewport_sync_source,
             self.full_verification_source,
             self.it_confirmation_source,
             self.it_verification_timeout_source,
@@ -380,6 +382,7 @@ class NewsDock(Gtk.Window):
                 GLib.source_remove(source)
         self.refresh_timer_source = None
         self.it_layout_source = None
+        self.it_viewport_sync_source = None
         self.full_verification_source = None
         self.it_confirmation_source = None
         self.it_verification_timeout_source = None
@@ -1017,6 +1020,7 @@ class NewsDock(Gtk.Window):
                 and visible_height >= minimum_viewport_height
             )
             required_label_width = 1
+            required_label_height = 1
             if name.startswith("it-"):
                 required_label_width = max(
                     1,
@@ -1025,15 +1029,21 @@ class NewsDock(Gtk.Window):
                     - label.get_margin_end()
                     - 2,
                 )
+                required_label_height = min(
+                    layout_height,
+                    max(1, visible_height - 6),
+                )
             checks[f"{name}_label_allocation"] = (
-                label_width >= required_label_width and label_height > 0
+                label_width >= required_label_width
+                and label_height >= required_label_height
             )
             checks[f"{name}_layout"] = (
                 layout_width > 0 and layout_height > 0 and line_count > 0
             )
             metrics.append(
                 f"{name}:{visible_width}x{visible_height}@{panel_x},{panel_y}"
-                f"/label={label_width}x{label_height}>={required_label_width}"
+                f"/label={label_width}x{label_height}"
+                f">={required_label_width}x{required_label_height}"
                 f"/layout={layout_width}x{layout_height}/lines={line_count}"
             )
 
@@ -1716,7 +1726,37 @@ class NewsDock(Gtk.Window):
         self.it_jobs_middle_overlay.queue_resize()
         self.middle_jobs_area.queue_resize()
         self.it_jobs_column.queue_resize()
+        self.schedule_it_viewport_sync()
         self.request_output_repaint()
+
+    def schedule_it_viewport_sync(self):
+        if self.it_viewport_sync_source is not None:
+            GLib.source_remove(self.it_viewport_sync_source)
+        self.it_viewport_sync_source = GLib.idle_add(self.sync_it_viewports, 0)
+
+    def sync_it_viewports(self, attempt):
+        self.it_viewport_sync_source = None
+        if self.closed:
+            return False
+        for panel, label in (
+            (self.it_jobs_middle_panel, self.jobs_it_middle_label),
+            (self.it_jobs_panel, self.jobs_it_label),
+        ):
+            layout = label.get_layout()
+            layout_height = layout.get_pixel_size()[1] if layout else 0
+            label.set_size_request(-1, max(1, layout_height))
+            adjustment = panel.get_vadjustment()
+            adjustment.set_value(adjustment.get_lower())
+            label.queue_resize()
+            panel.queue_resize()
+            panel.queue_draw()
+        if attempt < 2:
+            self.it_viewport_sync_source = GLib.timeout_add(
+                40,
+                self.sync_it_viewports,
+                attempt + 1,
+            )
+        return False
 
     def layout_it_jobs(self):
         self.it_layout_source = None
