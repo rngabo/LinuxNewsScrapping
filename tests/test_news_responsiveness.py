@@ -2,6 +2,9 @@
 
 import ctypes
 import html
+import json
+import os
+import tempfile
 import threading
 import time
 import unittest
@@ -90,6 +93,13 @@ class NewsResponsivenessTests(unittest.TestCase):
         self.addCleanup(warning_context.__exit__, None, None, None)
         warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"gi\.events")
         self.main_thread = threading.get_ident()
+        # Every test gets its own empty cache, never the user's real one.
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
+        self.cache_path = f"{cache_dir.name}/cache.json"
+        environment = patch.dict(os.environ, {"NEWS_DOCK_CACHE_FILE": self.cache_path})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.feeds = Feeds()
         self.window = None
 
@@ -139,6 +149,7 @@ class NewsResponsivenessTests(unittest.TestCase):
     def visible_it_titles(self):
         labels = []
         if self.window.it_jobs_middle_active:
+            labels.append(self.window.jobs_it_left_label)
             labels.append(self.window.jobs_it_middle_label)
         labels.append(self.window.jobs_it_label)
         return [line[2:] for label in labels for line in label.get_text().splitlines()
@@ -203,19 +214,23 @@ class NewsResponsivenessTests(unittest.TestCase):
             self.feeds.titles[category] = [
                 f"{category}-{i}: Resource Mobilization & Donor Engagement Specialist "
                 "for International Partnerships, Programme Development and Financial Management"
-                for i in range(3)
+                for i in range(6)
             ]
             expected.extend(f"- {title} ({name}) (Example & Co)"
                             for title in self.feeds.titles[category])
         self.feeds.titles["33"] = [f"IT engineer {i}" for i in range(60)]
         window = self.create_window()
         self.wait_for_refresh()
-        default_labels = (window.jobs_label, window.jobs_overflow_label)
+        default_labels = (window.jobs_label, window.jobs_overflow_label,
+                          window.jobs_third_label)
         compact = [f"- {news.compact_job_text(line[2:], news.DEFAULT_JOB_LINE_CHARS)}"
                    for line in expected]
         self.assertEqual(default_labels[0].get_text().splitlines(), compact[:4])
-        self.assertEqual(default_labels[1].get_text().splitlines(), compact[4:7])
+        self.assertEqual(default_labels[1].get_text().splitlines(), compact[4:8])
+        # The third column is dock column 4, shared with IT while IT is hidden.
+        self.assertEqual(default_labels[2].get_text().splitlines(), compact[8:11])
         self.assertTrue(window.jobs_overflow_label.get_visible())
+        self.assertTrue(window.jobs_third_label.get_visible())
         self.assertTrue(window.jobs_read_more.get_visible())
         for label in default_labels:
             layout = label.get_layout()
@@ -236,11 +251,13 @@ class NewsResponsivenessTests(unittest.TestCase):
         it_x, _ = window.it_jobs_column.translate_coordinates(window, 0, 0)
         self.assertLessEqual(overflow_x + window.jobs_overflow_label.get_allocated_width(), it_x)
 
-        # Read more replaces both default columns with the missing entries.
+        # Read more replaces the default columns with the missing entries.
         window.jobs_read_more.clicked()
         settle()
-        self.assertEqual(default_labels[0].get_text().splitlines(), compact[7:])
-        self.assertEqual(default_labels[1].get_text(), "")
+        # Seven remaining entries spread over the three columns: 3 + 3 + 1.
+        self.assertEqual(default_labels[0].get_text().splitlines(), compact[11:14])
+        self.assertEqual(default_labels[1].get_text().splitlines(), compact[14:17])
+        self.assertEqual(default_labels[2].get_text().splitlines(), compact[17:])
         self.assertFalse(window.jobs_read_more.get_visible())
         self.assertEqual(self.geometry(), baseline)
 
@@ -249,11 +266,18 @@ class NewsResponsivenessTests(unittest.TestCase):
         self.wait_for_refresh()
         self.assertTrue(window.it_jobs_middle_active)
         self.assertEqual(len(self.visible_it_titles()), 60)
+        # IT replaces the third default column while it is shown.
+        self.assertEqual(window.default_jobs_third_panel.get_opacity(), 0)
+        self.assertFalse(window.default_jobs_third_panel.is_sensitive())
+        # Long lists use dock columns 2, 3 and 4 in reading order.
+        self.assertEqual(window.jobs_it_left_label.get_text().splitlines(), [
+            f"- IT engineer {i} (Example & Co)" for i in range(20)
+        ])
         self.assertEqual(window.jobs_it_middle_label.get_text().splitlines(), [
-            f"- IT engineer {i} (Example & Co)" for i in range(30)
+            f"- IT engineer {i} (Example & Co)" for i in range(20, 40)
         ])
         self.assertTrue(window.jobs_it_label.get_text().startswith(
-            "- IT engineer 30 (Example & Co)"
+            "- IT engineer 40 (Example & Co)"
         ))
         self.assertAlmostEqual(
             window.it_jobs_middle_panel.get_allocated_width(),
@@ -264,7 +288,9 @@ class NewsResponsivenessTests(unittest.TestCase):
         window.it_jobs_toggle.clicked()
         settle()
         self.assertEqual(window.default_jobs_grid.get_opacity(), 1)
-        self.assertEqual(default_labels[0].get_text().splitlines(), compact[7:])
+        self.assertEqual(default_labels[0].get_text().splitlines(), compact[11:14])
+        self.assertEqual(window.default_jobs_third_panel.get_opacity(), 1)
+        self.assertTrue(window.default_jobs_third_panel.is_sensitive())
         self.assertEqual(self.geometry(), baseline)
 
     def test_default_overflow_appears_after_five_and_clears_when_list_shrinks(self):
@@ -278,9 +304,20 @@ class NewsResponsivenessTests(unittest.TestCase):
             window.refresh_jobs_panel()
             self.wait_for_refresh()
             expected = [f"- Economist {i} (Economics) (Example & Co)" for i in range(count)]
-            self.assertEqual(window.jobs_label.get_text().splitlines(), expected[:4])
-            self.assertEqual(window.jobs_overflow_label.get_text().splitlines(), expected[4:])
+            # Up to four stay in one column; longer lists spread over three
+            # (ceil(count / 3) each) so the last dock column is used too.
+            size = 4 if count <= 4 else -(-count // 3)
+            self.assertEqual(window.jobs_label.get_text().splitlines(), expected[:size])
+            self.assertEqual(
+                window.jobs_overflow_label.get_text().splitlines(), expected[size:size * 2]
+            )
+            self.assertEqual(
+                window.jobs_third_label.get_text().splitlines(), expected[size * 2:]
+            )
             self.assertEqual(window.jobs_overflow_label.get_visible(), count > 4)
+            self.assertEqual(
+                window.jobs_third_label.get_visible(), bool(expected[size * 2:])
+            )
             self.assertFalse(window.jobs_read_more.get_visible())
             self.assertEqual(window.it_jobs_toggle.get_label(), "Show")
             self.assertFalse(window.it_jobs_visible)
@@ -667,6 +704,42 @@ class NewsResponsivenessTests(unittest.TestCase):
         window.it_jobs_toggle.clicked()
         self.assertEqual(window.it_jobs_toggle.get_label(), "Show")
         self.assertEqual(window.default_jobs_grid.get_opacity(), 1)
+
+    def test_cache_shows_last_results_at_startup_and_survives_failures(self):
+        window = self.create_window()
+        window.it_jobs_toggle.clicked()
+        self.wait_for_refresh()
+        window.destroy()
+        with open(self.cache_path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(set(saved), {"news", "jobs", "it_jobs"})
+
+        # Everything fails and nothing has loaded yet: the cache is still shown.
+        self.feeds.fail.update(("news", "jobs", "it"))
+        for gate in self.feeds.gates.values():
+            gate.clear()
+        window = self.create_window()
+        self.assertIn("Rwanda ready", window.headline_labels["Rwanda"].get_text())
+        self.assertIn("Website developer", window.jobs_label.get_text())
+        expected_it = [f"{title} (Example & Co)" for title in self.feeds.titles["33"]]
+        self.assertEqual(window.it_job_titles, expected_it)
+        self.feeds.release()
+        window.it_jobs_toggle.clicked()
+        self.wait_for_refresh()
+        # Failed refreshes keep the last good results instead of error text.
+        self.assertIn("Rwanda ready", window.headline_labels["Rwanda"].get_text())
+        self.assertIn("Website developer", window.jobs_label.get_text())
+        self.assertNotIn("Failed", window.jobs_label.get_text())
+        self.assertEqual(window.it_job_titles, expected_it)
+
+    def test_corrupt_or_expired_cache_is_ignored(self):
+        with open(self.cache_path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        self.assertEqual(news.ResultCache(self.cache_path).data, {})
+        cache = news.ResultCache(self.cache_path)
+        cache.put("news", {"title": "Old", "link": "x"}, "Rwanda")
+        cache.data["news"]["Rwanda"]["saved"] -= news.CACHE_MAX_AGE_SECONDS + 5
+        self.assertIsNone(cache.get("news", "Rwanda"))
 
 
 if __name__ == "__main__":

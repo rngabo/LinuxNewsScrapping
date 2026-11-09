@@ -2,7 +2,10 @@
 
 Run `./news_app.sh start` (or `./news_app.sh restart` if already running).
 
-The dock height is fixed exclusively by the four news headline rows. Job lists
+The dock height is fixed exclusively by four single-line headline rows. Headlines
+are one line each so all four stay visible and fully readable. The first column
+widens to fit the longest headline (up to half the dock) and pushes the job
+columns to the right. Job lists
 never increase it. Default job positions use one line each: long position names
 are shortened, while category and company names in parentheses remain intact.
 Four entries fill the first middle column before continuing into the second.
@@ -59,3 +62,26 @@ logged explicitly.
 
 Run the GUI regression checks in an isolated display:
 `xvfb-run -a venv/bin/python -B -m unittest discover -s tests -v`.
+
+Click any job line in the middle or right columns (normal or IT) to open a small
+popup above the dock with the full position, category and company. Esc, a click
+elsewhere, or focus leaving the popup closes it. Dragging still moves the dock;
+only a press and release without movement counts as a click.
+
+When IT is shown, its list spreads in reading order over dock columns 2, 3 and 4
+(four to a column) once it has more than eight entries; up to eight use columns 3
+and 4, and up to four use column 4 only. While IT is hidden, the job columns use
+the otherwise empty IT area, starting right after the headline column.
+
+Results are cached in `~/.cache/news-dock/cache.json` (override with
+`NEWS_DOCK_CACHE_FILE`). The last good headlines, job categories and IT jobs
+appear immediately at startup and are replaced section by section as fresh
+results arrive. A failed fetch keeps the cached result instead of showing an
+error, and entries older than 24 hours are ignored. Writes are atomic.
+
+Under Mutter/XWayland the dock can stop painting and re-allocating after it is
+moved to another monitor, leaving stale content (for example IT lists showing
+only their first line). After every visible change (Show/Hide, Full, new
+results) the dock checks that GTK really painted and that the job labels got the
+height their text needs; if not it logs `paint_stalled` and remaps the window,
+at most once every five seconds.

@@ -1,6 +1,8 @@
 import faulthandler
+import json
 import logging
 import os
+import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import platform
@@ -140,8 +142,12 @@ except ImportError:
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Four one-line entries match the four headline rows which define the dock height.
+JOB_CATEGORY_ORDER = ("Website", "International relations", "Economics")
 DEFAULT_JOBS_PER_COLUMN = 4
-DEFAULT_JOBS_PER_PAGE_WITH_LINK = (DEFAULT_JOBS_PER_COLUMN * 2) - 1
+JOB_THIRD_COLUMN_RIGHT_MARGIN = 150
+DEFAULT_JOB_COLUMNS = 3  # dock columns 2 and 3, plus column 4 while IT is hidden
+DEFAULT_JOBS_PER_PAGE = DEFAULT_JOBS_PER_COLUMN * DEFAULT_JOB_COLUMNS
+DEFAULT_JOBS_PER_PAGE_WITH_LINK = DEFAULT_JOBS_PER_PAGE - 1
 TECH_JOBS_PER_COLUMN = 4
 DEFAULT_JOB_LINE_CHARS = 58
 TECH_RIGHT_LINE_CHARS = 46
@@ -189,6 +195,73 @@ def job_markup(text, max_chars=None):
 def job_display_text(text, max_chars=None):
     display_text = compact_job_text(text, max_chars) if max_chars else " ".join(text.split())
     return f"- {display_text}"
+
+
+# -----------------------------------------------------------------------------
+# Result cache (stale-while-revalidate)
+# -----------------------------------------------------------------------------
+CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+class ResultCache:
+    """Tiny JSON file cache of the last good results, safe across threads.
+
+    Layout: {"news": {section: {...}}, "jobs": {category: {...}}, "it_jobs": {...}}
+    where every entry carries a "saved" epoch time. Entries older than
+    CACHE_MAX_AGE_SECONDS are ignored. Writes are atomic (temp file + rename).
+    """
+
+    def __init__(self, path=None):
+        if path is None:
+            path = os.environ.get("NEWS_DOCK_CACHE_FILE") or (
+                Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+                / "news-dock" / "cache.json"
+            )
+        self.path = Path(path).expanduser()
+        self.lock = threading.Lock()
+        self.data = self._load()
+
+    def _load(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            LOGGER.exception("cache_load_failed path=%s", self.path)
+        return {}
+
+    def get(self, kind, key=None):
+        """Return the cached entry (dict) or None when missing/expired."""
+        with self.lock:
+            entry = self.data.get(kind)
+            if key is not None:
+                entry = entry.get(key) if isinstance(entry, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        saved = entry.get("saved")
+        if not isinstance(saved, (int, float)) or time.time() - saved > CACHE_MAX_AGE_SECONDS:
+            return None
+        return entry
+
+    def put(self, kind, value, key=None):
+        entry = dict(value, saved=int(time.time()))
+        with self.lock:
+            if key is None:
+                self.data[kind] = entry
+            else:
+                if not isinstance(self.data.get(kind), dict):
+                    self.data[kind] = {}
+                self.data[kind][key] = entry
+            payload = json.dumps(self.data, ensure_ascii=False)
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.path.with_name(self.path.name + ".tmp")
+                temporary.write_text(payload, encoding="utf-8")
+                os.replace(temporary, self.path)
+            except OSError:
+                LOGGER.exception("cache_write_failed path=%s", self.path)
 
 
 # -----------------------------------------------------------------------------
@@ -294,6 +367,11 @@ class NewsDock(Gtk.Window):
         self.dock_layout_generation = 0
         self.dock_settle_attempt = 0
         self.paint_serial = 0
+        self.paint_guard_source = None
+        self.last_remap_at = 0.0
+        self.job_label_titles = {}
+        self.job_popup = None
+        self.press_root = (0, 0)
         self.action_frame_counters = {}
         self.action_paint_counters = {}
         self.action_started_at = {}
@@ -340,11 +418,39 @@ class NewsDock(Gtk.Window):
             section: {"title": "Loading...", "link": ""}
             for section in ("Rwanda", "Tech", "World", "Africa")
         }
+        # Show the last good results immediately; fresh ones replace them as
+        # each feed finishes.
+        self.cache = ResultCache()
+        for section in self.news:
+            cached = self.cache.get("news", section)
+            if cached and cached.get("title"):
+                self.news[section] = {
+                    "title": cached["title"], "link": cached.get("link", ""),
+                }
+        self.default_jobs_by_category = {}
+        for category in JOB_CATEGORY_ORDER:
+            cached = self.cache.get("jobs", category)
+            if cached and isinstance(cached.get("items"), list):
+                self.default_jobs_by_category[category] = cached["items"]
+        self.default_job_titles = self.combined_default_jobs()
+        cached_it = self.cache.get("it_jobs")
+        if cached_it and isinstance(cached_it.get("items"), list) and cached_it["items"]:
+            self.it_job_titles = list(cached_it["items"])
+            self.it_jobs_message = None
+        LOGGER.info(
+            "cache_loaded path=%s news=%d job_categories=%d it_jobs=%d",
+            self.cache.path,
+            sum(1 for v in self.news.values() if v["title"] != "Loading..."),
+            len(self.default_jobs_by_category),
+            len(self.it_job_titles),
+        )
 
         # Build UI
         self.configure_window()
         self.create_news_layout()
         self.create_system_tray_icon()
+        if self.default_job_titles:
+            self.render_default_jobs_page()
 
         # Build the dock immediately; all feeds load outside the GTK thread.
         self.start_news_refresh_timer()
@@ -369,6 +475,7 @@ class NewsDock(Gtk.Window):
         )
         self.closed = True
         self.cancel_drag("window-destroyed")
+        self.close_job_popup()
         for source in (
             self.refresh_timer_source,
             self.it_layout_source,
@@ -377,6 +484,7 @@ class NewsDock(Gtk.Window):
             self.it_confirmation_source,
             self.it_verification_timeout_source,
             self.dock_settle_source,
+            self.paint_guard_source,
         ):
             if source:
                 GLib.source_remove(source)
@@ -387,6 +495,65 @@ class NewsDock(Gtk.Window):
         self.it_confirmation_source = None
         self.it_verification_timeout_source = None
         self.dock_settle_source = None
+        self.paint_guard_source = None
+
+    # -------------------------------------------------------------------------
+    # Frozen-paint recovery
+    # -------------------------------------------------------------------------
+    def guard_paint(self, reason):
+        """After a visible change, make sure GTK really paints it.
+
+        Under Mutter/XWayland the dock can stop painting and re-allocating
+        (frame clock frozen), typically after moving it to another monitor:
+        queue_draw/queue_resize are then ignored and the old content stays on
+        screen. A visible change always needs a paint, so if none happens
+        shortly after, remap the window to get a live frame clock again.
+        """
+        if self.closed or not self.get_mapped() or self.paint_guard_source is not None:
+            return
+        baseline = self.paint_serial
+        self.queue_draw()
+        self.paint_guard_source = GLib.timeout_add(
+            600, self.check_paint_guard, baseline, reason
+        )
+
+    def layout_stalled(self):
+        """True when a visible job label got less height than its text needs."""
+        for label in (
+            self.jobs_label,
+            self.jobs_overflow_label,
+            self.jobs_third_label,
+            self.jobs_it_left_label,
+            self.jobs_it_middle_label,
+            self.jobs_it_label,
+        ):
+            if not label.get_mapped() or not label.get_text():
+                continue
+            if label.get_allocated_height() + 2 < label.get_preferred_height()[1]:
+                return True
+        return False
+
+    def check_paint_guard(self, baseline, reason):
+        self.paint_guard_source = None
+        if self.closed or not self.get_mapped() or self.drag_in_progress:
+            return False
+        if self.paint_serial != baseline and not self.layout_stalled():
+            return False
+        now = time.monotonic()
+        if now - self.last_remap_at < 5:
+            LOGGER.warning("paint_stalled reason=%s action=skipped-rate-limit", reason)
+            return False
+        self.last_remap_at = now
+        LOGGER.warning(
+            "paint_stalled reason=%s serial=%d painted=%s action=remap",
+            reason, baseline, self.paint_serial != baseline,
+        )
+        self.hide()
+        self.show()
+        self.it_layout_key = None
+        self.queue_it_jobs_layout()
+        GLib.idle_add(self.resize_to_fit_content)
+        return False
 
     def on_window_drawn(self, widget, cairo_context):
         self.paint_serial += 1
@@ -535,6 +702,16 @@ class NewsDock(Gtk.Window):
         .read-button:hover {
             background-color: #2e3440;
         }
+        window.job-popup {
+            background: #2e3440;
+            border: 1px solid #81a1c1;
+        }
+        window.job-popup label {
+            color: #eceff4;
+        }
+        window.job-popup label.job-popup-title {
+            font-weight: bold;
+        }
         button.action-control {
             min-width: 48px;
             min-height: 24px;
@@ -604,9 +781,34 @@ class NewsDock(Gtk.Window):
         self.default_jobs_overflow_box.pack_start(
             self.jobs_overflow_label, False, False, 0
         )
-        self.default_jobs_overflow_box.pack_start(
-            self.jobs_read_more, False, False, 0
+
+        # Third default column: dock column 4, which is otherwise empty until
+        # the IT list is shown. It leaves room on the right for Full/Show.
+        self.jobs_third_label = Gtk.Label()
+        self.jobs_third_label.set_line_wrap(False)
+        self.jobs_third_label.set_valign(Gtk.Align.START)
+        self.jobs_third_label.set_halign(Gtk.Align.START)
+        self.jobs_third_label.set_xalign(0)
+        self.jobs_third_label.set_max_width_chars(40)
+        self.jobs_third_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.jobs_third_label.set_hexpand(True)
+        self.jobs_third_label.set_margin_end(JOB_THIRD_COLUMN_RIGHT_MARGIN)
+        self.jobs_third_label.set_markup("")
+        self.jobs_third_label.set_no_show_all(True)  # controlled manually
+        self.default_jobs_third_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.default_jobs_third_box.set_margin_start(10)
+        self.default_jobs_third_box.pack_start(self.jobs_third_label, False, False, 0)
+        self.default_jobs_third_box.pack_start(self.jobs_read_more, False, False, 0)
+        self.default_jobs_third_panel = Gtk.ScrolledWindow()
+        self.default_jobs_third_panel.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
         )
+        self.default_jobs_third_panel.set_propagate_natural_width(False)
+        self.default_jobs_third_panel.set_propagate_natural_height(False)
+        self.default_jobs_third_panel.set_vexpand(True)
+        self.default_jobs_third_panel.set_valign(Gtk.Align.FILL)
+        self.default_jobs_third_panel.get_style_context().add_class("jobs-scroll-panel")
+        self.default_jobs_third_panel.add(self.default_jobs_third_box)
 
         self.default_jobs_middle_panel = Gtk.ScrolledWindow()
         self.default_jobs_middle_panel.set_policy(
@@ -677,10 +879,31 @@ class NewsDock(Gtk.Window):
         self.it_jobs_middle_overlay.set_valign(Gtk.Align.FILL)
         self.it_jobs_middle_overlay.set_hexpand(True)
         self.it_jobs_middle_overlay.set_vexpand(True)
-        self.it_jobs_middle_spacer = Gtk.Box()
-        self.it_jobs_middle_overlay.attach(self.it_jobs_middle_spacer, 0, 0, 1, 1)
+        # Column 2 of the dock: used by IT only when its list needs three columns.
+        self.it_jobs_left_panel = Gtk.ScrolledWindow()
+        self.it_jobs_left_panel.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.it_jobs_left_panel.set_propagate_natural_width(False)
+        self.it_jobs_left_panel.set_propagate_natural_height(False)
+        self.it_jobs_left_panel.set_vexpand(True)
+        self.it_jobs_left_panel.set_valign(Gtk.Align.FILL)
+        self.it_jobs_left_panel.get_style_context().add_class("jobs-scroll-panel")
+        self.jobs_it_left_label = Gtk.Label()
+        self.jobs_it_left_label.set_line_wrap(False)
+        self.jobs_it_left_label.set_valign(Gtk.Align.START)
+        self.jobs_it_left_label.set_halign(Gtk.Align.FILL)
+        self.jobs_it_left_label.set_xalign(0)
+        self.jobs_it_left_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.jobs_it_left_label.set_margin_start(20)
+        self.jobs_it_left_label.set_margin_end(10)
+        self.it_jobs_left_panel.add(self.jobs_it_left_label)
+        self.it_jobs_left_panel.show_all()
+        self.it_jobs_left_panel.set_sensitive(False)
+        self.it_jobs_middle_overlay.attach(self.it_jobs_left_panel, 0, 0, 1, 1)
         self.it_jobs_middle_overlay.attach(self.it_jobs_middle_panel, 1, 0, 1, 1)
         self.middle_jobs_area.add_overlay(self.it_jobs_middle_overlay)
+        # Let wheel/scroll events reach the normal job columns underneath; the
+        # IT scroll panel inside the overlay keeps its own input window.
+        self.middle_jobs_area.set_overlay_pass_through(self.it_jobs_middle_overlay, True)
         self.middle_jobs_area.connect("size-allocate", self.queue_it_jobs_layout)
 
         # Reserve column 3 even while its text is hidden. Scrolling contains
@@ -739,6 +962,9 @@ class NewsDock(Gtk.Window):
         self.connect_control_diagnostics(self.jobs_read_more, "read-more")
 
         self.it_jobs_column.add(self.it_jobs_panel)
+        # Default listings share this column while IT is hidden (see set_it_columns).
+        self.it_jobs_column.add_overlay(self.default_jobs_third_panel)
+        self.it_jobs_column.set_overlay_pass_through(self.default_jobs_third_panel, False)
         # Direct overlay children are required here. Wrapping these buttons in
         # a non-windowed box makes them render but drops physical pointer input
         # on Mutter/XWayland.
@@ -790,6 +1016,12 @@ class NewsDock(Gtk.Window):
     # -------------------------------------------------------------------------
     # Populate grid
     # -------------------------------------------------------------------------
+    def style_headline_label(self, label):
+        """One line per headline. The column is sized to fit the text (see
+        headline_column_width); ellipsis only applies past the width cap."""
+        label.set_line_wrap(False)
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+
     def add_news_to_grid(self):
         for child in self.grid.get_children():
             self.grid.remove(child)
@@ -797,20 +1029,34 @@ class NewsDock(Gtk.Window):
         row_number = 0
         self.headline_labels = {}
 
+        # Headlines are single lines by default so all four stay visible. In Full
+        # mode they wrap inside this scroll panel, so long text scrolls instead of
+        # growing the dock (height is fixed by four single-line rows).
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.set_spacing(self.grid.get_row_spacing())
         for key, value in self.news.items():
             title_text = value['title']
             title = Gtk.Label.new(f"{key}: {title_text}")
-            title.set_line_wrap(False)
-            title.set_halign(Gtk.Align.START)
-            title.set_max_width_chars(80)
-            title.set_ellipsize(Pango.EllipsizeMode.END)
-            title.set_hexpand(True)
+            self.style_headline_label(title)
+            title.set_xalign(0)
+            title.set_halign(Gtk.Align.FILL)
+            title.set_valign(Gtk.Align.START)
             title.set_tooltip_text(f"{key}: {title_text}")
-
-            # col 0 = news headlines (no buttons)
-            self.grid.attach(title, 0, row_number, 1, 1)
+            box.pack_start(title, False, False, 0)
             self.headline_labels[key] = title
             row_number += 1
+
+        self.headline_panel = Gtk.ScrolledWindow()
+        self.headline_panel.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
+        self.headline_panel.set_propagate_natural_width(False)
+        self.headline_panel.set_propagate_natural_height(False)
+        self.headline_panel.set_hexpand(False)
+        self.headline_panel.set_vexpand(True)
+        self.headline_panel.set_valign(Gtk.Align.FILL)
+        self.headline_panel.get_style_context().add_class("jobs-scroll-panel")
+        self.headline_panel.add(box)
+        # col 0 = news headlines (no buttons)
+        self.grid.attach(self.headline_panel, 0, 0, 1, max(1, row_number))
 
         row_number = max(1, row_number)
         self.grid.attach(self.middle_jobs_area, 1, 0, 2, row_number)
@@ -834,33 +1080,69 @@ class NewsDock(Gtk.Window):
             name="default-jobs-fetch",
         ).start()
 
+    def combined_default_jobs(self):
+        titles = []
+        for category in JOB_CATEGORY_ORDER:
+            titles.extend(self.default_jobs_by_category.get(category, []))
+        return titles
+
     def fetch_jobs(self):
         started = time.monotonic()
-        titles = None
+        failures = 0
         try:
             with requests.Session() as session:
                 session.headers.update(self.session.headers)
-                titles = []
                 for url, category in (
                     (self.jobs_url, "Website"),
                     (self.jobs_international_url, "International relations"),
                     (self.jobs_economics_url, "Economics"),
                 ):
-                    titles.extend(scrape_jobinrwanda_titles(
-                        session, url, limit=6, include_employer=True, category_label=category
-                    ))
-            if not titles:
-                titles.append("Not yet.")
-
+                    try:
+                        items = scrape_jobinrwanda_titles(
+                            session, url, limit=6, include_employer=True,
+                            category_label=category,
+                        )
+                    except Exception:
+                        failures += 1
+                        LOGGER.exception("default_jobs_fetch_failed category=%s", category)
+                        continue
+                    self.cache.put("jobs", {"items": items}, category)
+                    # Show each category as soon as it arrives.
+                    GLib.idle_add(self.apply_job_category, category, items)
         except Exception:
-            titles = None
+            failures += 1
             LOGGER.exception("default_jobs_fetch_failed")
+        # Failed categories keep their cached listings; fail only if nothing
+        # at all (fresh or cached) is available.
+        with_cache = {
+            category: (self.cache.get("jobs", category) or {}).get("items")
+            for category in JOB_CATEGORY_ORDER
+        }
+        titles = []
+        for category in JOB_CATEGORY_ORDER:
+            if with_cache[category]:
+                titles.extend(with_cache[category])
+        if not titles:
+            titles = None if failures else ["Not yet."]
         LOGGER.info(
             "default_jobs_fetch_finished result_count=%s elapsed_seconds=%.3f",
             len(titles) if titles is not None else "failed",
             time.monotonic() - started,
         )
         GLib.idle_add(self.update_jobs_panel, titles)
+
+    def apply_job_category(self, category, items):
+        if self.closed:
+            return False
+        previous = self.default_job_titles
+        self.default_jobs_by_category[category] = items
+        self.default_job_titles = self.combined_default_jobs()
+        self.default_jobs_page = 0
+        self.render_default_jobs_page()
+        self.queue_it_jobs_layout()
+        if previous != self.default_job_titles:
+            self.guard_paint("jobs-category")
+        return False
 
     def update_jobs_panel(self, titles):
         self.jobs_loading = False
@@ -872,6 +1154,8 @@ class NewsDock(Gtk.Window):
         else:
             self.default_job_titles = ["Failed to load."]
         self.render_default_jobs_page()
+        if self.dock_workarea is not None:
+            self.size_job_columns(self.dock_workarea.width)
         LOGGER.info(
             "default_jobs_rendered total=%d page=%d full_titles=%s",
             len(self.default_job_titles),
@@ -882,18 +1166,23 @@ class NewsDock(Gtk.Window):
         self.queue_it_jobs_layout()
         return False
 
-    def render_default_jobs_page(self):
+    def split_default_jobs(self):
+        """Return (middle, overflow, third, has_more) for the current page."""
         start = self.default_jobs_page * DEFAULT_JOBS_PER_PAGE_WITH_LINK
         remaining = self.default_job_titles[start:]
-        has_more = len(remaining) > DEFAULT_JOBS_PER_COLUMN * 2
-        visible_count = (
-            DEFAULT_JOBS_PER_PAGE_WITH_LINK
-            if has_more else DEFAULT_JOBS_PER_COLUMN * 2
-        )
-        visible = remaining[:visible_count]
-        middle = visible[:DEFAULT_JOBS_PER_COLUMN]
-        overflow = visible[DEFAULT_JOBS_PER_COLUMN:]
+        has_more = len(remaining) > DEFAULT_JOBS_PER_PAGE
+        visible = remaining[:DEFAULT_JOBS_PER_PAGE_WITH_LINK if has_more else DEFAULT_JOBS_PER_PAGE]
+        count = len(visible)
+        if has_more or count <= DEFAULT_JOBS_PER_COLUMN:
+            # Full pages fill four per column; a short list stays in one column.
+            size = DEFAULT_JOBS_PER_COLUMN
+        else:
+            # Spread shorter lists evenly so the last column is used as well.
+            size = -(-count // DEFAULT_JOB_COLUMNS)
+        return visible[:size], visible[size:size * 2], visible[size * 2:], has_more
 
+    def render_default_jobs_page(self):
+        middle, overflow, third, has_more = self.split_default_jobs()
         max_chars = None if self.full_job_text else DEFAULT_JOB_LINE_CHARS
         self.jobs_label.set_markup("\n".join(
             job_markup(title, max_chars) for title in middle
@@ -901,8 +1190,15 @@ class NewsDock(Gtk.Window):
         self.jobs_overflow_label.set_markup("\n".join(
             job_markup(title, max_chars) for title in overflow
         ))
+        self.jobs_third_label.set_markup("\n".join(
+            job_markup(title, max_chars) for title in third
+        ))
         self.jobs_overflow_label.set_visible(bool(overflow))
+        self.jobs_third_label.set_visible(bool(third))
         self.jobs_read_more.set_visible(has_more)
+        self.job_label_titles[self.jobs_label] = middle
+        self.job_label_titles[self.jobs_overflow_label] = overflow
+        self.job_label_titles[self.jobs_third_label] = third
 
     def on_jobs_read_more(self, button):
         next_start = (self.default_jobs_page + 1) * DEFAULT_JOBS_PER_PAGE_WITH_LINK
@@ -1062,35 +1358,45 @@ class NewsDock(Gtk.Window):
         )
 
     def expected_default_column_text(self):
-        start = self.default_jobs_page * DEFAULT_JOBS_PER_PAGE_WITH_LINK
-        remaining = self.default_job_titles[start:]
-        has_more = len(remaining) > DEFAULT_JOBS_PER_COLUMN * 2
-        visible_count = (
-            DEFAULT_JOBS_PER_PAGE_WITH_LINK
-            if has_more else DEFAULT_JOBS_PER_COLUMN * 2
-        )
-        visible = remaining[:visible_count]
-        middle = visible[:DEFAULT_JOBS_PER_COLUMN]
-        overflow = visible[DEFAULT_JOBS_PER_COLUMN:]
+        middle, overflow, _, _ = self.split_default_jobs()
         max_chars = None if self.full_job_text else DEFAULT_JOB_LINE_CHARS
         return (
             "\n".join(job_display_text(title, max_chars) for title in middle),
             "\n".join(job_display_text(title, max_chars) for title in overflow),
         )
 
+    def split_it_titles(self):
+        """Split IT titles in reading order over dock columns 2, 3 and 4.
+
+        Up to four go in the far-right column; up to eight use the middle and
+        right; longer lists use all three columns (left = dock column 2).
+        """
+        titles = self.it_job_titles
+        count = len(titles)
+        if count <= TECH_JOBS_PER_COLUMN:
+            return [], [], titles
+        if count <= TECH_JOBS_PER_COLUMN * 2:
+            middle_count = max(TECH_JOBS_PER_COLUMN, (count + 1) // 2)
+            return [], titles[:middle_count], titles[middle_count:]
+        per_column = max(TECH_JOBS_PER_COLUMN, -(-count // 3))
+        return (
+            titles[:per_column],
+            titles[per_column:per_column * 2],
+            titles[per_column * 2:],
+        )
+
+    def it_line_chars(self, three_columns):
+        """Return (middle_chars, right_chars) for the current IT layout."""
+        if self.full_job_text:
+            return None, None
+        if three_columns:
+            return TECH_RIGHT_LINE_CHARS, TECH_RIGHT_LINE_CHARS
+        return TECH_MIDDLE_LINE_CHARS, TECH_RIGHT_LINE_CHARS
+
     def expected_it_column_text(self):
-        if len(self.it_job_titles) <= TECH_JOBS_PER_COLUMN:
-            middle_titles = []
-            right_titles = self.it_job_titles
-        else:
-            middle_count = max(
-                TECH_JOBS_PER_COLUMN,
-                (len(self.it_job_titles) + 1) // 2,
-            )
-            middle_titles = self.it_job_titles[:middle_count]
-            right_titles = self.it_job_titles[middle_count:]
-        right_chars = None if self.full_job_text else TECH_RIGHT_LINE_CHARS
-        middle_chars = None if self.full_job_text else TECH_MIDDLE_LINE_CHARS
+        _, middle_titles, right_titles = self.split_it_titles()
+        left_titles, _, _ = self.split_it_titles()
+        middle_chars, right_chars = self.it_line_chars(bool(left_titles))
         right = "\n".join(
             job_display_text(title, right_chars) for title in right_titles
         )
@@ -1587,6 +1893,8 @@ class NewsDock(Gtk.Window):
         for label in (
             self.jobs_label,
             self.jobs_overflow_label,
+            self.jobs_third_label,
+            self.jobs_it_left_label,
             self.jobs_it_middle_label,
             self.jobs_it_label,
         ):
@@ -1603,6 +1911,7 @@ class NewsDock(Gtk.Window):
         self.pending_full_verification = action_id
         self.queue_draw()
         self.schedule_full_action_verification(action_id, self.full_job_text)
+        self.guard_paint("full-toggle")
 
     def on_it_jobs_toggle(self, button):
         if self.pending_it_hide_verification is not None:
@@ -1620,6 +1929,9 @@ class NewsDock(Gtk.Window):
         action_id = self.next_action_id()
         visible = not self.it_jobs_visible
         self.it_jobs_visible = visible
+        self.update_third_default_column()
+        if self.dock_workarea is not None:
+            self.size_job_columns(self.dock_workarea.width)
         button.set_label("Hide" if visible else "Show")
         button.set_tooltip_text("Hide IT jobs" if visible else "Show IT jobs")
         LOGGER.info(
@@ -1647,6 +1959,7 @@ class NewsDock(Gtk.Window):
             self.queue_resize()
             self.queue_draw()
             self.schedule_it_hide_confirmation(action_id)
+        self.guard_paint("it-toggle")
 
     def refresh_it_jobs_panel(self):
         if self.closed:
@@ -1675,9 +1988,16 @@ class NewsDock(Gtk.Window):
                 )
             if not titles:
                 message = "- No IT jobs found."
+            else:
+                self.cache.put("it_jobs", {"items": titles})
         except Exception:
-            message = "Failed to load. Hide and show to retry."
             LOGGER.exception("it_jobs_fetch_failed")
+            cached = self.cache.get("it_jobs")
+            if cached and cached.get("items"):
+                titles = list(cached["items"])
+                LOGGER.info("it_jobs_using_cache count=%d", len(titles))
+            else:
+                message = "Failed to load. Hide and show to retry."
         LOGGER.info(
             "it_jobs_fetch_finished result_count=%d message=%r elapsed_seconds=%.3f",
             len(titles),
@@ -1690,6 +2010,7 @@ class NewsDock(Gtk.Window):
         self.it_jobs_loading = False
         if self.closed:
             return False
+        changed = titles != self.it_job_titles or message != self.it_jobs_message
         self.it_job_titles = titles
         self.it_jobs_message = message
         LOGGER.info(
@@ -1699,6 +2020,8 @@ class NewsDock(Gtk.Window):
             self.it_jobs_visible,
         )
         self.queue_it_jobs_layout()
+        if self.it_jobs_visible and changed:
+            self.guard_paint("it-jobs-result")
         return False
 
     def queue_it_jobs_layout(self, *args):
@@ -1709,7 +2032,7 @@ class NewsDock(Gtk.Window):
     def format_it_jobs(titles, max_chars=None):
         return "\n".join(job_markup(title, max_chars) for title in titles)
 
-    def set_it_columns(self, right_markup, middle_markup=None):
+    def set_it_columns(self, right_markup, middle_markup=None, left_markup=None):
         # Opacity keeps the default listings' size reserved without exposing
         # their text underneath IT. They continue refreshing while covered.
         show_middle = self.it_jobs_visible and bool(middle_markup)
@@ -1717,9 +2040,17 @@ class NewsDock(Gtk.Window):
         self.default_jobs_grid.set_opacity(0 if show_middle else 1)
         self.default_jobs_grid.set_sensitive(not show_middle)
         self.it_jobs_middle_panel.set_sensitive(show_middle)
+        self.it_jobs_left_panel.set_sensitive(show_middle and bool(left_markup))
+        self.update_third_default_column()
+        # While the IT middle view is shown it must receive wheel events; while
+        # hidden, the overlay must not cover the normal job columns.
+        self.middle_jobs_area.set_overlay_pass_through(
+            self.it_jobs_middle_overlay, not show_middle
+        )
         for label, markup in (
             (self.jobs_it_label, right_markup),
             (self.jobs_it_middle_label, middle_markup or ""),
+            (self.jobs_it_left_label, left_markup or ""),
         ):
             if label.get_label() != markup:
                 label.set_markup(markup)
@@ -1728,6 +2059,15 @@ class NewsDock(Gtk.Window):
         self.it_jobs_column.queue_resize()
         self.schedule_it_viewport_sync()
         self.request_output_repaint()
+
+    def update_third_default_column(self):
+        """The IT list takes over the last column from the third default column."""
+        third_visible = not self.it_jobs_visible
+        self.default_jobs_third_panel.set_opacity(1 if third_visible else 0)
+        self.default_jobs_third_panel.set_sensitive(third_visible)
+        self.it_jobs_column.set_overlay_pass_through(
+            self.default_jobs_third_panel, not third_visible
+        )
 
     def schedule_it_viewport_sync(self):
         if self.it_viewport_sync_source is not None:
@@ -1739,11 +2079,15 @@ class NewsDock(Gtk.Window):
         if self.closed:
             return False
         for panel, label in (
+            (self.it_jobs_left_panel, self.jobs_it_left_label),
             (self.it_jobs_middle_panel, self.jobs_it_middle_label),
             (self.it_jobs_panel, self.jobs_it_label),
         ):
-            layout = label.get_layout()
-            layout_height = layout.get_pixel_size()[1] if layout else 0
+            # Drop the previous pinned height first: measuring while it is still
+            # applied would keep a list that grew from "Loading..." at one line.
+            label.set_size_request(-1, -1)
+            width = max(1, label.get_allocated_width())
+            layout_height = label.get_preferred_height_for_width(width)[1]
             label.set_size_request(-1, max(1, layout_height))
             adjustment = panel.get_vadjustment()
             adjustment.set_value(adjustment.get_lower())
@@ -1756,6 +2100,10 @@ class NewsDock(Gtk.Window):
                 self.sync_it_viewports,
                 attempt + 1,
             )
+        else:
+            # Labels were resized after the last repaint request; repaint once
+            # more so the grown area (and the Show/Hide label) is not left stale.
+            self.request_output_repaint()
         return False
 
     def layout_it_jobs(self):
@@ -1775,23 +2123,17 @@ class NewsDock(Gtk.Window):
         # Up to four entries live only in the last column. Once the list needs
         # both columns, lay it out in natural left-to-right reading order and
         # keep at least four entries in the middle before continuing right.
-        if len(self.it_job_titles) <= TECH_JOBS_PER_COLUMN:
-            middle_titles = []
-            right_titles = self.it_job_titles
-        else:
-            middle_count = max(
-                TECH_JOBS_PER_COLUMN,
-                (len(self.it_job_titles) + 1) // 2,
-            )
-            middle_titles = self.it_job_titles[:middle_count]
-            right_titles = self.it_job_titles[middle_count:]
-        right_chars = None if self.full_job_text else TECH_RIGHT_LINE_CHARS
-        middle_chars = None if self.full_job_text else TECH_MIDDLE_LINE_CHARS
+        left_titles, middle_titles, right_titles = self.split_it_titles()
+        middle_chars, right_chars = self.it_line_chars(bool(left_titles))
         right = self.format_it_jobs(right_titles, right_chars)
         middle = self.format_it_jobs(middle_titles, middle_chars)
+        left = self.format_it_jobs(left_titles, middle_chars)
+        self.job_label_titles[self.jobs_it_left_label] = list(left_titles)
+        self.job_label_titles[self.jobs_it_label] = list(right_titles)
+        self.job_label_titles[self.jobs_it_middle_label] = list(middle_titles)
         if self.it_jobs_message:
             right += ("\n" if right else "") + GLib.markup_escape_text(self.it_jobs_message)
-        self.set_it_columns(right, middle or None)
+        self.set_it_columns(right, middle or None, left)
         LOGGER.info(
             "it_jobs_layout_rendered total=%d middle=%d right=%d full_titles=%s "
             "message=%r",
@@ -1844,6 +2186,26 @@ class NewsDock(Gtk.Window):
     # -------------------------------------------------------------------------
     # News display helpers
     # -------------------------------------------------------------------------
+    def apply_news_section(self, key, value):
+        """Show one section as soon as it arrives, while others still load."""
+        if self.closed or key not in self.headline_labels:
+            return False
+        text = f"{key}: {value['title']}"
+        changed = self.headline_labels[key].get_text() != text
+        self.news[key] = value
+        self.headline_labels[key].set_text(text)
+        self.headline_labels[key].set_tooltip_text(text)
+        self.relayout_after_headlines()
+        if changed:
+            self.guard_paint("news-section")
+        return False
+
+    def relayout_after_headlines(self):
+        if self.dock_workarea is not None:
+            self.size_job_columns(self.dock_workarea.width)
+            self.it_layout_key = None
+            self.queue_it_jobs_layout()
+
     def update_news_display(self, headlines):
         self.news_loading = False
         if self.closed or headlines is None:
@@ -1859,6 +2221,7 @@ class NewsDock(Gtk.Window):
             self.headline_labels[key].set_text(text)
             self.headline_labels[key].set_tooltip_text(text)
         LOGGER.info("news_result_applied sections=%d", len(headlines))
+        self.relayout_after_headlines()
         return False
 
     def refresh_news(self):
@@ -1892,7 +2255,12 @@ class NewsDock(Gtk.Window):
         try:
             with requests.Session() as session:
                 session.headers.update(self.session.headers)
-                headlines = self.fetch_news(session)
+                headlines = self.fetch_news(
+                    session,
+                    on_section=lambda key, value: GLib.idle_add(
+                        self.apply_news_section, key, dict(value)
+                    ),
+                )
         except Exception:
             LOGGER.exception("news_refresh_failed")
         LOGGER.info(
@@ -1905,7 +2273,7 @@ class NewsDock(Gtk.Window):
     # -------------------------------------------------------------------------
     # News fetcher
     # -------------------------------------------------------------------------
-    def fetch_news(self, session=None):
+    def fetch_news(self, session=None, on_section=None):
         session = session or self.session
         parsers = {
             "Rwanda": ("https://www.newtimes.co.rw/",          self.rwanda_parser),
@@ -1924,10 +2292,26 @@ class NewsDock(Gtk.Window):
                     "title": content.get("title", ""),
                     "link":  content.get("link",  ""),
                 }
+                # Parser failures carry no link; only real headlines are cached.
+                if news[key]["title"] and news[key]["link"]:
+                    self.cache.put("news", dict(news[key]), key)
+                else:
+                    news[key] = self.cached_news_or(news[key], key)
             except requests.exceptions.RequestException:
                 LOGGER.exception("news_section_fetch_failed section=%s url=%s", key, url)
-                news[key] = {"title": "Failed to fetch news.", "link": ""}
+                news[key] = self.cached_news_or(
+                    {"title": "Failed to fetch news.", "link": ""}, key
+                )
+            if on_section is not None:
+                on_section(key, news[key])
         return news
+
+    def cached_news_or(self, fallback, key):
+        cached = self.cache.get("news", key)
+        if cached and cached.get("title"):
+            LOGGER.info("news_section_using_cache section=%s", key)
+            return {"title": cached["title"], "link": cached.get("link", "")}
+        return fallback
 
     # -------------------------------------------------------------------------
     # Parsers
@@ -2158,26 +2542,45 @@ class NewsDock(Gtk.Window):
         return False
 
     def headline_height(self):
-        labels = list(self.headline_labels.values())
-        content_height = sum(label.get_preferred_height()[1] for label in labels)
-        spacing = self.grid.get_row_spacing() * max(0, len(labels) - 1)
+        # Four single-line rows define the dock height, independent of how
+        # many lines the wrapped headline text currently needs.
+        line = self.headline_labels and next(iter(self.headline_labels.values()))
+        line_height = line.create_pango_layout("Ag").get_pixel_size()[1] if line else 0
+        count = len(self.headline_labels)
+        spacing = self.grid.get_row_spacing() * max(0, count - 1)
         return (
             self.grid.get_margin_top()
-            + content_height
+            + line_height * count
             + spacing
             + self.grid.get_margin_bottom()
         )
+
+    def headline_column_width(self, usable_width):
+        """Width the headlines need to be fully readable, within sane limits."""
+        natural = 0
+        for label in self.headline_labels.values():
+            natural = max(
+                natural, label.create_pango_layout(label.get_text()).get_pixel_size()[0]
+            )
+        return max(200, min(natural + 12, usable_width // 2))
 
     def size_job_columns(self, work_width):
         margins = self.grid.get_margin_start() + self.grid.get_margin_end()
         spacing = self.grid.get_column_spacing()
         usable_width = max(1, work_width - margins - (spacing * 3))
-        column_width = max(120, usable_width // 4)
+        # Long headlines dictate the first column; the job columns start right
+        # after it and share the remaining width equally.
+        first_width = self.headline_column_width(usable_width)
+        # Three equal job columns: the third holds the default listings while
+        # IT is hidden, and the IT columns while it is shown.
+        column_width = right_width = max(120, (usable_width - first_width) // 3)
         middle_width = (column_width * 2) + spacing
+        self.headline_panel.set_size_request(first_width, -1)
         self.middle_jobs_area.set_size_request(middle_width, -1)
         self.it_jobs_middle_overlay.set_size_request(middle_width, -1)
         self.it_jobs_middle_panel.set_size_request(column_width, -1)
-        self.it_jobs_column.set_size_request(column_width, -1)
+        self.it_jobs_left_panel.set_size_request(column_width, -1)
+        self.it_jobs_column.set_size_request(right_width, -1)
         return column_width, middle_width
 
     def request_output_repaint(self, regions=()):
@@ -2373,6 +2776,8 @@ class NewsDock(Gtk.Window):
             )
             return False
 
+        self.close_job_popup()
+        self.press_root = (int(event.x_root), int(event.y_root))
         self.cancel_drag("new-drag")
         win_x, win_y = self.get_position()
         self.drag_in_progress = True
@@ -2463,11 +2868,135 @@ class NewsDock(Gtk.Window):
         if event.button != Gdk.BUTTON_PRIMARY or not self.drag_in_progress:
             return False
 
+        x_root, y_root = int(event.x_root), int(event.y_root)
+        is_click = (
+            abs(x_root - self.press_root[0]) <= 4
+            and abs(y_root - self.press_root[1]) <= 4
+        )
         self.finish_drag(
-            self.get_monitor_for_point(int(event.x_root), int(event.y_root)),
+            self.get_monitor_for_point(x_root, y_root),
             reason="button-release",
         )
+        if is_click:
+            title = self.job_at_root(*self.press_root)
+            if title:
+                self.show_job_popup(title, x_root)
         return True
+
+    # -------------------------------------------------------------------------
+    # Job detail popup
+    # -------------------------------------------------------------------------
+    def job_at_root(self, x_root, y_root):
+        """Return the full title of the job line under a root-coordinate point."""
+        gdk_window = self.get_window()
+        if not gdk_window:
+            return None
+        origin = gdk_window.get_origin()
+        px, py = x_root - origin[-2], y_root - origin[-1]
+        for panel, label in (
+            (self.default_jobs_middle_panel, self.jobs_label),
+            (self.default_jobs_overflow_panel, self.jobs_overflow_label),
+            (self.default_jobs_third_panel, self.jobs_third_label),
+            (self.it_jobs_left_panel, self.jobs_it_left_label),
+            (self.it_jobs_middle_panel, self.jobs_it_middle_label),
+            (self.it_jobs_panel, self.jobs_it_label),
+        ):
+            titles = self.job_label_titles.get(label)
+            if not titles or not panel.get_mapped() or not panel.is_sensitive():
+                continue
+            panel_pos = panel.translate_coordinates(self, 0, 0)
+            label_pos = label.translate_coordinates(self, 0, 0)
+            if not panel_pos or not label_pos:
+                continue
+            if not (
+                panel_pos[0] <= px < panel_pos[0] + panel.get_allocated_width()
+                and panel_pos[1] <= py < panel_pos[1] + panel.get_allocated_height()
+            ):
+                continue
+            local_x, local_y = px - label_pos[0], py - label_pos[1]
+            if not (
+                0 <= local_x < label.get_allocated_width()
+                and 0 <= local_y < label.get_allocated_height()
+            ):
+                continue
+            layout = label.get_layout()
+            _, index, _ = layout.xy_to_index(
+                int(local_x * Pango.SCALE), int(local_y * Pango.SCALE)
+            )
+            text = layout.get_text().encode("utf-8")[:index].decode("utf-8", "ignore")
+            item = text.count("\n")
+            if item < len(titles):
+                return titles[item]
+        return None
+
+    @staticmethod
+    def split_job_title(title):
+        match = re.match(r"^(.*?)((?:\s*\([^()]*\))*)$", title)
+        position = match.group(1).strip() if match else title
+        parts = re.findall(r"\(([^()]*)\)", match.group(2)) if match else []
+        return position or title, parts
+
+    def show_job_popup(self, title, x_root):
+        self.close_job_popup()
+        position, parts = self.split_job_title(title)
+        labels = {2: ("Category", "Company"), 1: ("Company",)}.get(len(parts))
+
+        popup = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        popup.set_decorated(False)
+        popup.set_resizable(False)
+        popup.set_skip_taskbar_hint(True)
+        popup.set_skip_pager_hint(True)
+        popup.set_keep_above(True)
+        popup.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        popup.get_style_context().add_class("job-popup")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        for margin in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{margin}")(10)
+        heading = Gtk.Label(label=position)
+        heading.get_style_context().add_class("job-popup-title")
+        box.pack_start(heading, False, False, 0)
+        for index, part in enumerate(parts):
+            prefix = f"{labels[index]}: " if labels else ""
+            box.pack_start(Gtk.Label(label=prefix + part), False, False, 0)
+        for label in box.get_children():
+            label.set_line_wrap(True)
+            label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            label.set_max_width_chars(60)
+            label.set_xalign(0)
+        popup.add(box)
+
+        popup.focused = False
+        popup.connect("focus-in-event", lambda w, e: setattr(w, "focused", True) or False)
+        popup.connect(
+            "focus-out-event",
+            lambda w, e: self.close_job_popup() if w.focused else False,
+        )
+        popup.connect(
+            "key-press-event",
+            lambda w, e: self.close_job_popup() if e.keyval == Gdk.KEY_Escape else False,
+        )
+        popup.show_all()
+        width, height = popup.get_preferred_size()[1].width, popup.get_preferred_size()[1].height
+        monitor = self.get_monitor_for_point(x_root, self.press_root[1])
+        area = monitor.get_geometry() if monitor else None
+        left = x_root - width // 2
+        if area:
+            left = max(area.x, min(left, area.x + area.width - width))
+        work = self.dock_workarea
+        dock_top = (
+            work.y + work.height - self.headline_height() if work
+            else self.get_position()[1]
+        )
+        popup.move(left, max(0, dock_top - height - 8))
+        self.job_popup = popup
+        popup.present()
+        LOGGER.info("job_popup_opened title=%r", title)
+
+    def close_job_popup(self):
+        popup, self.job_popup = self.job_popup, None
+        if popup is not None:
+            popup.destroy()
+        return False
 
     def set_strut(self, xid, monitor, preferred_height=None):
         if not monitor:
