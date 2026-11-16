@@ -655,8 +655,11 @@ class NewsDock(Gtk.Window):
             color: #eceff4;
         }
         button {
-            background-color: #242933;
-            color: #eceff4;
+            background-color: #2e3440;
+            background-image: none;
+            box-shadow: none;
+            text-shadow: none;
+            color: #4c566a;
             border: none;
             padding: 2px 6px;
             margin: 0px;
@@ -665,13 +668,17 @@ class NewsDock(Gtk.Window):
             font-size: 10px;
         }
         button:hover {
-            background-color: #1a1f28;
+            background-color: #343b4a;
+            background-image: none;
+            color: #81a1c1;
         }
         button.it-jobs-toggle {
-            background: #242933;
+            background: #2e3440;
+            background-image: none;
         }
         button.it-jobs-toggle:hover {
-            background: #1a1f28;
+            background: #343b4a;
+            background-image: none;
         }
         button.jobs-read-more {
             background: transparent;
@@ -698,11 +705,12 @@ class NewsDock(Gtk.Window):
             background: transparent;
         }
         .read-button {
-            background: #242933;
+            background: #2e3440;
+            background-image: none;
             margin-left: 15px;
         }
         .read-button:hover {
-            background-color: #2e3440;
+            background-color: #343b4a;
         }
         window.job-popup {
             background: #2e3440;
