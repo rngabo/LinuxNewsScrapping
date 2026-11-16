@@ -404,6 +404,10 @@ class NewsDock(Gtk.Window):
             "?filter_titles_field=&field_job_category_target_id=33"
         )
         self.it_jobs_loading = False
+        self.popup_kind = "it"
+        self.ire_loading = False
+        self.ire_job_titles = []
+        self.ire_jobs_message = "Loading..."
         self.it_jobs_visible = False
         self.it_jobs_middle_active = False
         self.it_job_titles = []
@@ -449,8 +453,6 @@ class NewsDock(Gtk.Window):
         self.configure_window()
         self.create_news_layout()
         self.create_system_tray_icon()
-        if self.default_job_titles:
-            self.render_default_jobs_page()
 
         # Build the dock immediately; all feeds load outside the GTK thread.
         self.start_news_refresh_timer()
@@ -712,6 +714,27 @@ class NewsDock(Gtk.Window):
         window.job-popup label.job-popup-title {
             font-weight: bold;
         }
+        window.it-popup label.it-heading {
+            font-size: 16px;
+            font-weight: bold;
+            color: #88c0d0;
+        }
+        window.it-popup label.it-position {
+            font-size: 14px;
+            font-weight: bold;
+            color: #eceff4;
+        }
+        window.it-popup label.it-company {
+            font-size: 12px;
+            color: #a3b0c4;
+        }
+        window.it-popup separator {
+            background: #485264;
+        }
+        window.it-popup scrolledwindow,
+        window.it-popup viewport {
+            background: transparent;
+        }
         button.action-control {
             min-width: 48px;
             min-height: 24px;
@@ -866,6 +889,8 @@ class NewsDock(Gtk.Window):
         self.it_jobs_middle_panel.add(self.jobs_it_middle_label)
         self.it_jobs_middle_panel.show_all()
         self.it_jobs_middle_panel.set_sensitive(False)
+        self.it_jobs_middle_panel.set_no_show_all(True)
+        self.it_jobs_middle_panel.hide()
 
         # A lone END-aligned overlay child can retain a 1x1 allocation after
         # Mutter/XWayland moves the dock between differently sized monitors.
@@ -898,6 +923,11 @@ class NewsDock(Gtk.Window):
         self.it_jobs_left_panel.add(self.jobs_it_left_label)
         self.it_jobs_left_panel.show_all()
         self.it_jobs_left_panel.set_sensitive(False)
+        # Inactive panels are hidden (not just transparent): even insensitive
+        # panels keep an input window that swallows wheel events meant for the
+        # job columns underneath.
+        self.it_jobs_left_panel.set_no_show_all(True)
+        self.it_jobs_left_panel.hide()
         self.it_jobs_middle_overlay.attach(self.it_jobs_left_panel, 0, 0, 1, 1)
         self.it_jobs_middle_overlay.attach(self.it_jobs_middle_panel, 1, 0, 1, 1)
         self.middle_jobs_area.add_overlay(self.it_jobs_middle_overlay)
@@ -1059,8 +1089,26 @@ class NewsDock(Gtk.Window):
         self.grid.attach(self.headline_panel, 0, 0, 1, max(1, row_number))
 
         row_number = max(1, row_number)
-        self.grid.attach(self.middle_jobs_area, 1, 0, 2, row_number)
-        self.grid.attach(self.it_jobs_column, 3, 0, 1, row_number)
+        # Column 1 is the only content; a single button follows it.
+        self.it_button = Gtk.Button(label="IJ")
+        self.it_button.get_style_context().add_class("action-control")
+        self.it_button.set_tooltip_text("Show the latest IT jobs")
+        self.it_button.connect("clicked", self.on_it_button_clicked, "it")
+        self.connect_control_diagnostics(self.it_button, "it-jobs")
+        self.ire_button = Gtk.Button(label="IR-EC")
+        self.ire_button.get_style_context().add_class("action-control")
+        self.ire_button.set_tooltip_text(
+            "Show the latest international relations and economics jobs"
+        )
+        self.ire_button.connect("clicked", self.on_it_button_clicked, "ire")
+        self.connect_control_diagnostics(self.ire_button, "ire-jobs")
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        button_box.set_halign(Gtk.Align.END)
+        button_box.set_hexpand(True)
+        button_box.set_valign(Gtk.Align.CENTER)
+        button_box.pack_start(self.ire_button, False, False, 0)
+        button_box.pack_start(self.it_button, False, False, 0)
+        self.grid.attach(button_box, 1, 0, 1, row_number)
 
     # -------------------------------------------------------------------------
     # Jobs panel refresh
@@ -2020,8 +2068,8 @@ class NewsDock(Gtk.Window):
             self.it_jobs_visible,
         )
         self.queue_it_jobs_layout()
-        if self.it_jobs_visible and changed:
-            self.guard_paint("it-jobs-result")
+        if self.job_popup is not None and getattr(self, "it_popup_box", None):
+            self.fill_it_popup()
         return False
 
     def queue_it_jobs_layout(self, *args):
@@ -2040,7 +2088,10 @@ class NewsDock(Gtk.Window):
         self.default_jobs_grid.set_opacity(0 if show_middle else 1)
         self.default_jobs_grid.set_sensitive(not show_middle)
         self.it_jobs_middle_panel.set_sensitive(show_middle)
-        self.it_jobs_left_panel.set_sensitive(show_middle and bool(left_markup))
+        self.it_jobs_middle_panel.set_visible(show_middle)
+        show_left = show_middle and bool(left_markup)
+        self.it_jobs_left_panel.set_sensitive(show_left)
+        self.it_jobs_left_panel.set_visible(show_left)
         self.update_third_default_column()
         # While the IT middle view is shown it must receive wheel events; while
         # hidden, the overlay must not cover the normal job columns.
@@ -2065,6 +2116,7 @@ class NewsDock(Gtk.Window):
         third_visible = not self.it_jobs_visible
         self.default_jobs_third_panel.set_opacity(1 if third_visible else 0)
         self.default_jobs_third_panel.set_sensitive(third_visible)
+        self.default_jobs_third_panel.set_visible(third_visible)
         self.it_jobs_column.set_overlay_pass_through(
             self.default_jobs_third_panel, not third_visible
         )
@@ -2244,9 +2296,11 @@ class NewsDock(Gtk.Window):
                 daemon=True,
                 name="news-fetch",
             ).start()
-        self.refresh_jobs_panel()
-        if self.it_jobs_visible:
-            self.refresh_it_jobs_panel()
+        if self.job_popup is not None:
+            if self.popup_kind == "it":
+                self.refresh_it_jobs_panel()
+            else:
+                self.refresh_ire_jobs()
         return True
 
     def fetch_and_display_news(self):
@@ -2995,8 +3049,177 @@ class NewsDock(Gtk.Window):
     def close_job_popup(self):
         popup, self.job_popup = self.job_popup, None
         if popup is not None:
+            self.it_popup_closed_at = time.monotonic()
+            self.it_popup_closed_kind = self.popup_kind
+            self.it_popup_box = None
             popup.destroy()
         return False
+
+    # -------------------------------------------------------------------------
+    # IT jobs popup
+    # -------------------------------------------------------------------------
+    def on_it_button_clicked(self, button, kind="it"):
+        LOGGER.info(
+            "action_requested control=%s-jobs popup_open=%s", kind, self.job_popup is not None
+        )
+        # A focus-out close fires just before this click when the button is
+        # pressed while the popup is open; treat that as a toggle-off.
+        if self.job_popup is not None:
+            was_kind = self.popup_kind
+            self.close_job_popup()
+            if was_kind == kind:
+                return
+        elif (
+            time.monotonic() - getattr(self, "it_popup_closed_at", 0.0) < 0.3
+            and getattr(self, "it_popup_closed_kind", None) == kind
+        ):
+            return
+        self.popup_kind = kind
+        self.show_it_popup()
+        if kind == "it":
+            self.refresh_it_jobs_panel()
+        else:
+            self.refresh_ire_jobs()
+
+    def refresh_ire_jobs(self):
+        if self.ire_loading or self.closed:
+            return
+        self.ire_loading = True
+        threading.Thread(target=self.fetch_ire_jobs, daemon=True, name="ire-jobs-fetch").start()
+
+    def fetch_ire_jobs(self):
+        titles, message = [], None
+        try:
+            with requests.Session() as session:
+                for url, label in (
+                    (self.jobs_international_url, "International relations"),
+                    (self.jobs_economics_url, "Economics"),
+                ):
+                    titles.extend(scrape_jobinrwanda_titles(
+                        session, url, limit=None, include_employer=True,
+                        category_label=label,
+                    ))
+            if titles:
+                self.cache.put("ire_jobs", {"items": titles})
+            else:
+                message = "No jobs found."
+        except Exception:
+            LOGGER.exception("ire_jobs_fetch_failed")
+            cached = self.cache.get("ire_jobs")
+            if cached and cached.get("items"):
+                titles = list(cached["items"])
+            else:
+                message = "Failed to load. Close and reopen to retry."
+        GLib.idle_add(self.update_ire_jobs, titles, message)
+
+    def update_ire_jobs(self, titles, message):
+        self.ire_loading = False
+        if self.closed:
+            return False
+        self.ire_job_titles = titles
+        self.ire_jobs_message = message
+        if self.job_popup is not None and getattr(self, "it_popup_box", None):
+            self.fill_it_popup()
+        return False
+
+    def show_it_popup(self):
+        popup = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        popup.set_decorated(False)
+        popup.set_resizable(False)
+        popup.set_skip_taskbar_hint(True)
+        popup.set_skip_pager_hint(True)
+        popup.set_keep_above(True)
+        popup.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        popup.get_style_context().add_class("job-popup")
+        popup.get_style_context().add_class("it-popup")
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for margin in ("top", "bottom", "start", "end"):
+            getattr(outer, f"set_margin_{margin}")(16)
+        self.it_popup_heading = Gtk.Label(xalign=0)
+        self.it_popup_heading.get_style_context().add_class("it-heading")
+        outer.pack_start(self.it_popup_heading, False, False, 0)
+        self.it_popup_scroll = Gtk.ScrolledWindow()
+        self.it_popup_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.it_popup_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.it_popup_box.set_margin_end(12)
+        self.it_popup_scroll.add(self.it_popup_box)
+        outer.pack_start(self.it_popup_scroll, True, True, 0)
+        popup.add(outer)
+
+        popup.focused = False
+        popup.connect("focus-in-event", lambda w, e: setattr(w, "focused", True) or False)
+        popup.connect(
+            "focus-out-event",
+            lambda w, e: self.close_job_popup() if w.focused else False,
+        )
+        popup.connect(
+            "key-press-event",
+            lambda w, e: self.close_job_popup() if e.keyval == Gdk.KEY_Escape else False,
+        )
+        self.job_popup = popup
+        self.fill_it_popup()
+        popup.present()
+        LOGGER.info("it_popup_opened kind=%s", self.popup_kind)
+
+    def fill_it_popup(self):
+        popup = self.job_popup
+        box = getattr(self, "it_popup_box", None)
+        if popup is None or box is None:
+            return
+        for child in box.get_children():
+            box.remove(child)
+        if self.popup_kind == "it":
+            titles, name, message = self.it_job_titles, "IT jobs", self.it_jobs_message
+        else:
+            titles, name = self.ire_job_titles, "International relations & economics jobs"
+            message = self.ire_jobs_message
+        if titles:
+            self.it_popup_heading.set_text(f"{name} - {len(titles)} listings, latest first")
+        else:
+            self.it_popup_heading.set_text(name)
+            text = (message or "Loading...").lstrip("- ")
+            note = Gtk.Label(label=text, xalign=0)
+            note.get_style_context().add_class("it-company")
+            box.pack_start(note, False, False, 0)
+        for index, title in enumerate(titles):
+            position, parts = self.split_job_title(title)
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            heading = Gtk.Label(label=f"{index + 1}. {position}", xalign=0)
+            heading.get_style_context().add_class("it-position")
+            heading.set_line_wrap(True)
+            heading.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            heading.set_selectable(False)
+            row.pack_start(heading, False, False, 0)
+            if parts:
+                company = Gtk.Label(label=" - ".join(parts), xalign=0)
+                company.get_style_context().add_class("it-company")
+                company.set_line_wrap(True)
+                company.set_margin_start(22)
+                row.pack_start(company, False, False, 0)
+            box.pack_start(row, False, False, 0)
+            if index < len(titles) - 1:
+                box.pack_start(Gtk.Separator(), False, False, 2)
+        popup.show_all()
+
+        monitor = self.current_monitor or self.get_default_monitor()
+        area = monitor.get_geometry() if monitor else None
+        screen_w = area.width if area else 1280
+        screen_h = area.height if area else 800
+        width = max(600, min(int(screen_w * 0.7), 1300))
+        content_h = box.get_preferred_height()[1]
+        max_h = int(screen_h * 0.75)
+        scroll_h = max(60, min(content_h, max_h - 70))
+        self.it_popup_scroll.set_size_request(width, scroll_h)
+        popup.resize(1, 1)
+        popup_h = popup.get_preferred_size()[1].height
+        work = self.dock_workarea
+        dock_top = (
+            work.y + work.height - self.headline_height() if work
+            else self.get_position()[1]
+        )
+        left = (area.x + (screen_w - width) // 2) if area else 0
+        popup.move(left, max(0, dock_top - popup_h - 8))
 
     def set_strut(self, xid, monitor, preferred_height=None):
         if not monitor:

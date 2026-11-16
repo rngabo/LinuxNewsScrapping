@@ -85,3 +85,10 @@ only their first line). After every visible change (Show/Hide, Full, new
 results) the dock checks that GTK really painted and that the job labels got the
 height their text needs; if not it logs `paint_stalled` and remaps the window,
 at most once every five seconds.
+
+While IT is hidden the normal job listings also use the last dock column (it
+shows the Full/Show buttons at the bottom right, so its text keeps a right
+margin for them). Up to four entries stay in one column; longer lists spread
+evenly over the three columns, and full pages hold four per column with
+**(read more)** at the end of the last one. Show replaces the last column with
+the IT list and Hide brings the normal listings back.

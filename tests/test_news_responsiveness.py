@@ -741,6 +741,63 @@ class NewsResponsivenessTests(unittest.TestCase):
         cache.data["news"]["Rwanda"]["saved"] -= news.CACHE_MAX_AGE_SECONDS + 5
         self.assertIsNone(cache.get("news", "Rwanda"))
 
+    def test_mouse_wheel_scrolls_every_panel_that_needs_it(self):
+        try:
+            x11 = ctypes.CDLL("libX11.so.6")
+            xtst = ctypes.CDLL("libXtst.so.6")
+        except OSError:
+            self.skipTest("X11 wheel simulation requires libXtst")
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XFlush.argtypes = [ctypes.c_void_p]
+        xtst.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_ulong]
+        xtst.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                            ctypes.c_int, ctypes.c_ulong]
+        display = x11.XOpenDisplay(None)
+        if not display:
+            self.skipTest("X11 display required for wheel events")
+
+        long_title = "Position with a long title (Economics) (Some Company Ltd) " * 2
+        for category in ("All", "29", "13"):
+            self.feeds.titles[category] = [f"{category}-{i} {long_title}" for i in range(6)]
+        self.feeds.titles["33"] = [f"IT engineer {i} {long_title}" for i in range(30)]
+        window = self.create_window()
+        self.wait_for_refresh()
+        window.on_full_jobs_toggle(window.jobs_full_toggle)  # wrapped text needs scrolling
+        settle()
+        origin = window.get_window().get_origin()[-2:]
+
+        def wheel_scrolls(panel):
+            adjustment = panel.get_vadjustment()
+            self.assertGreater(adjustment.get_upper(), adjustment.get_page_size() + 1)
+            before = adjustment.get_value()
+            x, y = panel.translate_coordinates(window, 0, 0)
+            xtst.XTestFakeMotionEvent(
+                display, -1,
+                origin[0] + x + panel.get_allocated_width() // 2,
+                origin[1] + y + panel.get_allocated_height() // 2, 0,
+            )
+            x11.XFlush(display)
+            settle()
+            for _ in range(5):
+                xtst.XTestFakeButtonEvent(display, 5, 1, 0)
+                xtst.XTestFakeButtonEvent(display, 5, 0, 0)
+                x11.XFlush(display)
+                settle()
+            return adjustment.get_value() > before
+
+        # Inactive panels must not cover the active ones (hidden, not just clear).
+        for panel in (window.default_jobs_middle_panel, window.default_jobs_overflow_panel,
+                      window.default_jobs_third_panel):
+            self.assertTrue(wheel_scrolls(panel), panel)
+        window.it_jobs_toggle.clicked()
+        self.wait_for_refresh()
+        settle()
+        for panel in (window.it_jobs_left_panel, window.it_jobs_middle_panel,
+                      window.it_jobs_panel):
+            self.assertTrue(wheel_scrolls(panel), panel)
+
 
 if __name__ == "__main__":
     unittest.main()
